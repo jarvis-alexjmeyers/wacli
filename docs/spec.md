@@ -189,7 +189,7 @@ WhatsApp Web history is best-effort. If you want to try fetching *older* message
 `RECIPIENT` accepts a JID, phone number, or synced contact/group/chat name. If a name is ambiguous, interactive terminals prompt; scripts can pass `--pick N`.
 Text sends automatically include a link preview for the first `http://` or `https://` URL unless `--no-preview` is passed.
 Voice notes require OGG/Opus audio and use optional `ffprobe`/`ffmpeg` metadata when available.
-Stickers require WebP input and are stored locally as `sticker` media after sending.
+Stickers require 512x512 WebP input and are stored locally as `sticker` media after sending. Static stickers are capped at 100 KiB; animated stickers are capped at 500 KiB and carry animation metadata in the outgoing proto.
 
 Send-file uploads and media downloads are capped at 100 MiB to avoid reading
 or writing unexpectedly large payloads in one command.

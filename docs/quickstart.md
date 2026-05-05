@@ -77,8 +77,8 @@ wacli send text --to 1234567890 --message "replying" --reply-to <message-id>
 # Send a file with a caption
 wacli send file --to 1234567890 --file ./pic.jpg --caption "hi"
 
-# Send a WebP sticker
-wacli send sticker --to 1234567890 --file ./sticker.webp
+# Send a 512x512 WebP sticker
+wacli send sticker --to 1234567890 --file ./sticker-512.webp
 
 # Send a native voice note (OGG/Opus)
 wacli send voice --to 1234567890 --file ./voice.ogg

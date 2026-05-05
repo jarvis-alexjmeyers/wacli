@@ -23,6 +23,7 @@
 - Send: add `send file --reply-to` for quoted media/document replies. (#68 — thanks @vlassance)
 - Send: add repeatable `send text --mention` for WhatsApp user mentions in group messages. (#16 — thanks @nicozefrench and @sheepworrier)
 - Send: add automatic link previews for text messages with `--no-preview` opt-out. (#94, #95 — thanks @elgatoflaco)
+- Send: add `send sticker` for 512x512 WebP stickers, including animated-sticker metadata. (#205, #27 — thanks @dinakars777 and @fm1randa)
 - Send: add `send voice` and `send file --ptt` for OGG/Opus WhatsApp voice notes. (#40, #41 — thanks @ricardopolo and @emre6943)
 - Send: accept common phone-number formatting in recipient flags while still storing digits-only WhatsApp JIDs. (#130 — thanks @fahmidme and @ImLukeF)
 - Send: resolve `send text/file --to` against local contacts, groups, and chats, with `--pick` for non-interactive disambiguation. (#122 — thanks @AndroidPoet)

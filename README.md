@@ -131,8 +131,8 @@ pnpm wacli send file --to 1234567890 --file ./pic.jpg --caption "hi"
 pnpm wacli send file --to 1234567890 --file ./pic.jpg --caption "replying" --reply-to <message-id>
 # Or override display name
 pnpm wacli send file --to 1234567890 --file /tmp/abc123 --filename report.pdf
-# Send a WebP sticker
-pnpm wacli send sticker --to 1234567890 --file ./sticker.webp
+# Send a 512x512 WebP sticker
+pnpm wacli send sticker --to 1234567890 --file ./sticker-512.webp
 # Send an OGG/Opus audio file as a native WhatsApp voice note
 pnpm wacli send voice --to 1234567890 --file ./voice.ogg
 
