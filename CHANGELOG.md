@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Media: sanitize `#`, control-wrapped blanks, and single-dot path components in generated media paths.
 - Store: remove starred-message metadata when deleting chat-local data so cleanup cannot leave stale starred state behind.
 
 ## 0.9.0 - 2026-05-15
