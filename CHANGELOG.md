@@ -6,6 +6,7 @@
 
 - Accounts: reject invalid account configs before saving and ignore relative `XDG_STATE_HOME` for default state paths.
 - CLI: honor canceled store-lock waits before acquiring locks and stop reporting non-contention lock failures as ordinary contention.
+- Media: fail before downloading when the output directory exists but is not writable.
 - Media: sanitize `#`, control-wrapped blanks, and single-dot path components in generated media paths.
 - Store: remove starred-message metadata when deleting chat-local data so cleanup cannot leave stale starred state behind.
 

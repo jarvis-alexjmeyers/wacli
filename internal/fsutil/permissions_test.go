@@ -140,3 +140,18 @@ func TestEnsureWritableDirCreatesPrivateDir(t *testing.T) {
 		t.Fatalf("mode = %04o, want 0700", got)
 	}
 }
+
+func TestEnsureWritableDirRejectsNonWritableDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "readonly")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("Chmod setup: %v", err)
+	}
+	defer os.Chmod(dir, 0o700)
+
+	if err := EnsureWritableDir(dir); err == nil {
+		t.Fatalf("expected error for non-writable dir")
+	}
+}
