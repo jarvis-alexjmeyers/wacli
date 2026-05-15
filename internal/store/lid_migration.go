@@ -2,12 +2,13 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 )
 
 // HistoricalLIDJIDs returns distinct hidden-user JIDs stored in chat and
-// message identity columns. The app layer resolves these through whatsmeow.
+// message/poll identity columns. The app layer resolves these through whatsmeow.
 func (d *DB) HistoricalLIDJIDs() ([]string, error) {
 	rows, err := d.sql.Query(`
 		SELECT jid FROM chats WHERE jid GLOB '*@lid'
@@ -15,6 +16,14 @@ func (d *DB) HistoricalLIDJIDs() ([]string, error) {
 		SELECT chat_jid FROM messages WHERE chat_jid GLOB '*@lid'
 		UNION
 		SELECT sender_jid FROM messages WHERE sender_jid GLOB '*@lid'
+		UNION
+		SELECT chat_jid FROM polls WHERE chat_jid GLOB '*@lid'
+		UNION
+		SELECT sender_jid FROM polls WHERE sender_jid GLOB '*@lid' AND chat_jid NOT GLOB '*@g.us'
+		UNION
+		SELECT chat_jid FROM poll_votes WHERE chat_jid GLOB '*@lid'
+		UNION
+		SELECT voter_jid FROM poll_votes WHERE voter_jid GLOB '*@lid'
 		ORDER BY 1
 	`)
 	if err != nil {
@@ -67,6 +76,9 @@ func (d *DB) MigrateLIDToPN(lidJID, pnJID string) error {
 		return err
 	}
 	if err := migrateLIDSenderToPN(tx, lidJID, pnJID); err != nil {
+		return err
+	}
+	if err := migrateLIDPollsToPN(tx, lidJID, pnJID); err != nil {
 		return err
 	}
 	if err := deleteLIDChat(tx, lidJID); err != nil {
@@ -224,6 +236,138 @@ func migrateLIDSenderToPN(tx *sql.Tx, lidJID, pnJID string) error {
 		return fmt.Errorf("rewrite lid message senders: %w", err)
 	}
 	return nil
+}
+
+func migrateLIDPollsToPN(tx *sql.Tx, lidJID, pnJID string) error {
+	if err := migrateLIDPollRowsToPN(tx, lidJID, pnJID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM polls WHERE chat_jid = ? OR (sender_jid = ? AND chat_jid NOT GLOB '*@g.us')`, lidJID, lidJID); err != nil {
+		return fmt.Errorf("delete migrated lid polls: %w", err)
+	}
+
+	if _, err := tx.Exec(`
+		INSERT INTO poll_votes(chat_jid, poll_msg_id, voter_jid, vote_msg_id, selected_options_json, ts)
+		SELECT
+			CASE WHEN chat_jid = ? THEN ? ELSE chat_jid END,
+			poll_msg_id,
+			CASE WHEN voter_jid = ? THEN ? ELSE voter_jid END,
+			vote_msg_id,
+			selected_options_json,
+			ts
+		FROM poll_votes
+		WHERE chat_jid = ? OR voter_jid = ?
+		ON CONFLICT(chat_jid, poll_msg_id, voter_jid) DO UPDATE SET
+			vote_msg_id = excluded.vote_msg_id,
+			selected_options_json = excluded.selected_options_json,
+			ts = excluded.ts
+		WHERE excluded.ts >= poll_votes.ts
+	`, lidJID, pnJID, lidJID, pnJID, lidJID, lidJID); err != nil {
+		return fmt.Errorf("merge lid poll votes into pn rows: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM poll_votes WHERE chat_jid = ? OR voter_jid = ?`, lidJID, lidJID); err != nil {
+		return fmt.Errorf("delete migrated lid poll votes: %w", err)
+	}
+	return nil
+}
+
+func migrateLIDPollRowsToPN(tx *sql.Tx, lidJID, pnJID string) error {
+	rows, err := tx.Query(`
+		SELECT chat_jid, msg_id, COALESCE(sender_jid,''), question, options_json, selectable_count, created_ts
+		FROM polls
+		WHERE chat_jid = ? OR (sender_jid = ? AND chat_jid NOT GLOB '*@g.us')
+	`, lidJID, lidJID)
+	if err != nil {
+		return fmt.Errorf("load lid polls: %w", err)
+	}
+	defer rows.Close()
+
+	type pollRow struct {
+		chatJID         string
+		msgID           string
+		senderJID       string
+		question        string
+		optionsJSON     string
+		selectableCount int64
+		createdTS       int64
+	}
+	var polls []pollRow
+	for rows.Next() {
+		var p pollRow
+		if err := rows.Scan(&p.chatJID, &p.msgID, &p.senderJID, &p.question, &p.optionsJSON, &p.selectableCount, &p.createdTS); err != nil {
+			return fmt.Errorf("scan lid poll: %w", err)
+		}
+		polls = append(polls, p)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, p := range polls {
+		destChat := p.chatJID
+		if destChat == lidJID {
+			destChat = pnJID
+		}
+		destSender := p.senderJID
+		if destSender == lidJID && !strings.HasSuffix(p.chatJID, "@g.us") {
+			destSender = pnJID
+		}
+		optionsJSON, err := mergedPollOptionsJSONTx(tx, destChat, p.msgID, p.optionsJSON)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO polls(chat_jid, msg_id, sender_jid, question, options_json, selectable_count, created_ts)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(chat_jid, msg_id) DO UPDATE SET
+				sender_jid = COALESCE(NULLIF(excluded.sender_jid, ''), polls.sender_jid),
+				question = excluded.question,
+				options_json = excluded.options_json,
+				selectable_count = excluded.selectable_count,
+				created_ts = max(polls.created_ts, excluded.created_ts)
+		`, destChat, p.msgID, destSender, p.question, optionsJSON, p.selectableCount, p.createdTS); err != nil {
+			return fmt.Errorf("merge lid poll into pn row: %w", err)
+		}
+	}
+	return nil
+}
+
+func mergedPollOptionsJSONTx(tx *sql.Tx, chatJID, msgID, incomingJSON string) (string, error) {
+	incoming, err := decodePollOptionsJSON(incomingJSON)
+	if err != nil {
+		return "", err
+	}
+	var existingJSON string
+	err = tx.QueryRow(`SELECT options_json FROM polls WHERE chat_jid = ? AND msg_id = ?`, chatJID, msgID).Scan(&existingJSON)
+	if err == nil {
+		existing, err := decodePollOptionsJSON(existingJSON)
+		if err != nil {
+			return "", err
+		}
+		incoming = mergePollOptions(incoming, existing)
+	} else if !isNoRows(err) {
+		return "", err
+	}
+	out, err := json.Marshal(incoming)
+	if err != nil {
+		return "", fmt.Errorf("marshal migrated poll options: %w", err)
+	}
+	return string(out), nil
+}
+
+func decodePollOptionsJSON(raw string) ([]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	var options []string
+	if err := json.Unmarshal([]byte(raw), &options); err != nil {
+		return nil, fmt.Errorf("unmarshal migrated poll options: %w", err)
+	}
+	return options, nil
+}
+
+func isNoRows(err error) bool {
+	return err == sql.ErrNoRows
 }
 
 func deleteLIDChat(tx *sql.Tx, lidJID string) error {

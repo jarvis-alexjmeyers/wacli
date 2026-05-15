@@ -43,9 +43,14 @@ type fakeWA struct {
 
 	decryptedReaction   *waProto.ReactionMessage
 	decryptReactionErr  error
+	sendPollCalls       []fakeSendPollCall
+	sendPollVoteCalls   []fakeSendPollVoteCall
+	decryptPollVoteFunc func(evt *events.Message) (*waE2E.PollVoteMessage, error)
+	decryptSecretFunc   func(evt *events.Message) (*waE2E.Message, error)
 	onDemandHistory     func(lastKnown types.MessageInfo, count int) *events.HistorySync
 	onDemandEvent       func(lastKnown types.MessageInfo, count int) interface{}
 	downloadHistory     func(notif *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error)
+	deleteHistoryCalls  []*waE2E.HistorySyncNotification
 	appStateRecoveryErr error
 	appStateFetchErr    error
 	appStateFetchEvent  func(name string, fullSync, onlyIfNotSynced bool) interface{}
@@ -82,6 +87,19 @@ type fakeMarkReadCall struct {
 	read       bool
 	lastMsgTS  time.Time
 	lastMsgKey *waCommon.MessageKey
+}
+
+type fakeSendPollCall struct {
+	to         types.JID
+	name       string
+	options    []string
+	selectable int
+	ephemeral  bool
+}
+
+type fakeSendPollVoteCall struct {
+	pollInfo types.MessageInfo
+	options  []string
 }
 
 type fakeAppStateFetch struct {
@@ -370,6 +388,55 @@ func (f *fakeWA) SendReaction(ctx context.Context, chat, sender types.JID, targe
 	return types.MessageID("reactionid"), nil
 }
 
+func (f *fakeWA) SendPoll(ctx context.Context, to types.JID, name string, options []string, selectable int, ephemeral bool) (types.MessageID, error) {
+	f.mu.Lock()
+	f.sendPollCalls = append(f.sendPollCalls, fakeSendPollCall{
+		to:         to,
+		name:       name,
+		options:    append([]string(nil), options...),
+		selectable: selectable,
+		ephemeral:  ephemeral,
+	})
+	f.mu.Unlock()
+	return types.MessageID("pollid"), nil
+}
+
+func (f *fakeWA) SendPollVote(ctx context.Context, pollInfo *types.MessageInfo, options []string) (types.MessageID, error) {
+	if pollInfo == nil {
+		return "", fmt.Errorf("poll info required")
+	}
+	f.mu.Lock()
+	f.sendPollVoteCalls = append(f.sendPollVoteCalls, fakeSendPollVoteCall{
+		pollInfo: *pollInfo,
+		options:  append([]string(nil), options...),
+	})
+	f.mu.Unlock()
+	return types.MessageID("pollvoteid"), nil
+}
+
+func (f *fakeWA) DecryptPollVote(ctx context.Context, evt *events.Message) (*waE2E.PollVoteMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	cb := f.decryptPollVoteFunc
+	f.mu.Unlock()
+	if cb != nil {
+		return cb(evt)
+	}
+	return nil, fmt.Errorf("not supported")
+}
+
+func (f *fakeWA) DecryptSecretEncryptedMessage(ctx context.Context, evt *events.Message) (*waE2E.Message, error) {
+	f.mu.Lock()
+	cb := f.decryptSecretFunc
+	f.mu.Unlock()
+	if cb != nil {
+		return cb(evt)
+	}
+	return nil, fmt.Errorf("not supported")
+}
+
 func (f *fakeWA) RevokeMessage(ctx context.Context, chat types.JID, targetID types.MessageID) (types.MessageID, error) {
 	return types.MessageID("revokeid"), nil
 }
@@ -416,6 +483,13 @@ func (f *fakeWA) DownloadHistorySync(ctx context.Context, notif *waE2E.HistorySy
 	return cb(notif)
 }
 
+func (f *fakeWA) DeleteHistorySyncMedia(ctx context.Context, notif *waE2E.HistorySyncNotification) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleteHistoryCalls = append(f.deleteHistoryCalls, notif)
+	return nil
+}
+
 func (f *fakeWA) ParseWebMessage(chatJID types.JID, webMsg *waWeb.WebMessageInfo) (*events.Message, error) {
 	if chatJID.IsEmpty() {
 		parsed, err := types.ParseJID(webMsg.GetKey().GetRemoteJID())
@@ -425,14 +499,18 @@ func (f *fakeWA) ParseWebMessage(chatJID types.JID, webMsg *waWeb.WebMessageInfo
 		chatJID = parsed
 	}
 	sender := chatJID
-	if participant := webMsg.GetParticipant(); participant != "" {
+	if webMsg.GetKey().GetFromMe() {
+		if linked, err := types.ParseJID(f.LinkedJID()); err == nil {
+			sender = linked
+		}
+	} else if participant := webMsg.GetParticipant(); participant != "" {
 		parsed, err := types.ParseJID(participant)
 		if err != nil {
 			return nil, err
 		}
 		sender = parsed
 	}
-	return &events.Message{
+	evt := &events.Message{
 		Info: types.MessageInfo{
 			MessageSource: types.MessageSource{
 				Chat:     chatJID,
@@ -443,8 +521,10 @@ func (f *fakeWA) ParseWebMessage(chatJID types.JID, webMsg *waWeb.WebMessageInfo
 			ID:        webMsg.GetKey().GetID(),
 			Timestamp: time.Unix(int64(webMsg.GetMessageTimestamp()), 0).UTC(),
 		},
-		Message: webMsg.GetMessage(),
-	}, nil
+		RawMessage: webMsg.GetMessage(),
+	}
+	evt.UnwrapRaw()
+	return evt, nil
 }
 
 func (f *fakeWA) DownloadMediaToFile(ctx context.Context, directPath string, encFileHash, fileHash, mediaKey []byte, fileLength uint64, mediaType, mmsType string, targetPath string) (int64, error) {

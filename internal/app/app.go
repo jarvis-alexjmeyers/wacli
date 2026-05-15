@@ -57,6 +57,10 @@ type WAClient interface {
 	SendProtoMessage(ctx context.Context, to types.JID, msg *waProto.Message) (types.MessageID, error)
 	SendProtoMessageWithExtra(ctx context.Context, to types.JID, msg *waProto.Message, mediaHandle string) (types.MessageID, error)
 	SendReaction(ctx context.Context, chat, sender types.JID, targetID types.MessageID, reaction string) (types.MessageID, error)
+	SendPoll(ctx context.Context, to types.JID, name string, options []string, selectable int, ephemeral bool) (types.MessageID, error)
+	SendPollVote(ctx context.Context, pollInfo *types.MessageInfo, options []string) (types.MessageID, error)
+	DecryptPollVote(ctx context.Context, evt *events.Message) (*waE2E.PollVoteMessage, error)
+	DecryptSecretEncryptedMessage(ctx context.Context, evt *events.Message) (*waE2E.Message, error)
 	RevokeMessage(ctx context.Context, chat types.JID, targetID types.MessageID) (types.MessageID, error)
 	DeleteMessageForMe(ctx context.Context, info types.MessageInfo, deleteMedia bool) error
 	EditMessage(ctx context.Context, chat types.JID, targetID types.MessageID, text string) (types.MessageID, error)
@@ -73,6 +77,7 @@ type WAClient interface {
 	DecryptReaction(ctx context.Context, reaction *events.Message) (*waProto.ReactionMessage, error)
 	SetManualHistorySyncDownload(enabled bool)
 	DownloadHistorySync(ctx context.Context, notif *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error)
+	DeleteHistorySyncMedia(ctx context.Context, notif *waE2E.HistorySyncNotification) error
 	RequestHistorySyncOnDemand(ctx context.Context, lastKnown types.MessageInfo, count int) (types.MessageID, error)
 	FetchAppState(ctx context.Context, name string, fullSync, onlyIfNotSynced bool) error
 	RequestAppStateRecovery(ctx context.Context, name string) (types.MessageID, error)

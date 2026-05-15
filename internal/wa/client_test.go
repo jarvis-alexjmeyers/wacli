@@ -1,6 +1,7 @@
 package wa
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -9,7 +10,10 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
+	waStore "go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestNewEnablesRetryMessageStore(t *testing.T) {
@@ -63,6 +67,91 @@ func TestBuildDeleteForMePatch(t *testing.T) {
 	action := mut.Value.GetDeleteMessageForMeAction()
 	if action == nil || !action.GetDeleteMedia() || action.GetMessageTimestamp() != ts.UnixMilli() {
 		t.Fatalf("delete-for-me action = %+v", action)
+	}
+}
+
+func TestWrapEphemeralPollMessagePreservesSecretOnOuterMessage(t *testing.T) {
+	secret := []byte("poll-secret")
+	inner := &waProto.Message{
+		PollCreationMessage: &waProto.PollCreationMessage{Name: proto.String("Lunch?")},
+		MessageContextInfo:  &waProto.MessageContextInfo{MessageSecret: secret},
+	}
+
+	wrapped := wrapEphemeralPollMessage(inner)
+	if wrapped.GetEphemeralMessage().GetMessage() != inner {
+		t.Fatalf("inner message not wrapped")
+	}
+	if got := wrapped.GetMessageContextInfo().GetMessageSecret(); string(got) != string(secret) {
+		t.Fatalf("outer message secret = %q, want %q", got, secret)
+	}
+}
+
+func TestRewritePollVoteInfoForLIDRewritesDM(t *testing.T) {
+	chat := types.NewJID("15551234567", types.DefaultUserServer)
+	sender := types.NewJID("15557654321", types.DefaultUserServer)
+	info := types.MessageInfo{
+		MessageSource: types.MessageSource{Chat: chat, Sender: sender},
+		ID:            "poll-id",
+	}
+	cli := &whatsmeow.Client{Store: &waStore.Device{LIDMigrationTimestamp: 1}}
+
+	got := rewritePollVoteInfoForLID(context.Background(), cli, info, func(_ context.Context, _ *whatsmeow.Client, jid types.JID) types.JID {
+		return types.NewJID(jid.User+"lid", types.HiddenUserServer)
+	})
+
+	if got.Chat.Server != types.HiddenUserServer || got.Chat.User != chat.User+"lid" {
+		t.Fatalf("chat = %s", got.Chat)
+	}
+	if got.Sender.Server != types.HiddenUserServer || got.Sender.User != sender.User+"lid" {
+		t.Fatalf("sender = %s", got.Sender)
+	}
+}
+
+func TestRewritePollVoteInfoForLIDLeavesGroupSenderPN(t *testing.T) {
+	group := types.NewJID("120363001234567890", types.GroupServer)
+	sender := types.NewJID("15557654321", types.DefaultUserServer)
+	info := types.MessageInfo{
+		MessageSource: types.MessageSource{Chat: group, Sender: sender, IsGroup: true},
+		ID:            "poll-id",
+	}
+	cli := &whatsmeow.Client{Store: &waStore.Device{LIDMigrationTimestamp: 1}}
+	calls := 0
+
+	got := rewritePollVoteInfoForLID(context.Background(), cli, info, func(_ context.Context, _ *whatsmeow.Client, jid types.JID) types.JID {
+		calls++
+		return types.NewJID(jid.User+"lid", types.HiddenUserServer)
+	})
+
+	if got.Chat != group {
+		t.Fatalf("chat = %s, want %s", got.Chat, group)
+	}
+	if got.Sender != sender {
+		t.Fatalf("sender = %s, want %s", got.Sender, sender)
+	}
+	if calls != 0 {
+		t.Fatalf("resolver calls = %d, want 0", calls)
+	}
+}
+
+func TestResolvePNToLIDUsesOwnLIDWithoutCache(t *testing.T) {
+	pn := types.NewJID("15551234567", types.DefaultUserServer)
+	lid := types.NewJID("999123456789", types.HiddenUserServer)
+	cli := &whatsmeow.Client{Store: &waStore.Device{ID: &pn, LID: lid, LIDMigrationTimestamp: 1}}
+
+	got := (&Client{}).resolvePNToLIDLocked(context.Background(), cli, pn)
+	if got != lid {
+		t.Fatalf("resolved = %s, want %s", got, lid)
+	}
+}
+
+func TestResolvePNToLIDPublicUsesOwnLIDWithoutCache(t *testing.T) {
+	pn := types.NewJID("15551234567", types.DefaultUserServer)
+	lid := types.NewJID("999123456789", types.HiddenUserServer)
+	c := &Client{client: &whatsmeow.Client{Store: &waStore.Device{ID: &pn, LID: lid, LIDMigrationTimestamp: 1}}}
+
+	got := c.ResolvePNToLID(context.Background(), pn)
+	if got != lid {
+		t.Fatalf("resolved = %s, want %s", got, lid)
 	}
 }
 

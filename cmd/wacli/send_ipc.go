@@ -46,6 +46,9 @@ type sendDelegateRequest struct {
 	ID                   string   `json:"id,omitempty"`
 	Reaction             string   `json:"reaction,omitempty"`
 	Sender               string   `json:"sender,omitempty"`
+	Question             string   `json:"question,omitempty"`
+	Options              []string `json:"options,omitempty"`
+	Selectable           int      `json:"selectable,omitempty"`
 	PostSendWaitMS       int64    `json:"post_send_wait_ms,omitempty"`
 	TimeoutMS            int64    `json:"timeout_ms,omitempty"`
 }
@@ -58,6 +61,9 @@ type sendDelegateResponse struct {
 	ID       string            `json:"id,omitempty"`
 	Target   string            `json:"target,omitempty"`
 	Reaction string            `json:"reaction,omitempty"`
+	Question string            `json:"question,omitempty"`
+	Options  []string          `json:"options,omitempty"`
+	Selected []string          `json:"selected,omitempty"`
 	File     map[string]string `json:"file,omitempty"`
 }
 
@@ -194,6 +200,10 @@ func executeDelegatedSend(parent context.Context, a *app.App, req sendDelegateRe
 		return executeDelegatedSticker(ctx, a, req)
 	case "react":
 		return executeDelegatedReact(ctx, a, req)
+	case "poll":
+		return executeDelegatedPoll(ctx, a, req)
+	case "poll_vote":
+		return executeDelegatedPollVote(ctx, a, req)
 	default:
 		return sendDelegateResponse{}, fmt.Errorf("unsupported send kind %q", req.Kind)
 	}
@@ -331,6 +341,14 @@ func writeDelegatedSendOutput(flags *rootFlags, kind string, resp sendDelegateRe
 			body["target"] = resp.Target
 			body["reaction"] = resp.Reaction
 		}
+		if kind == "poll" {
+			body["question"] = resp.Question
+			body["options"] = resp.Options
+		}
+		if kind == "poll_vote" {
+			body["target"] = resp.Target
+			body["selected"] = resp.Selected
+		}
 		return out.WriteJSON(os.Stdout, body)
 	}
 	switch kind {
@@ -346,6 +364,10 @@ func writeDelegatedSendOutput(flags *rootFlags, kind string, resp sendDelegateRe
 		} else {
 			fmt.Fprintf(os.Stdout, "Reacted %s to %s (id %s)\n", resp.Reaction, resp.Target, resp.ID)
 		}
+	case "poll":
+		fmt.Fprintf(os.Stdout, "Sent poll to %s (id %s)\n", resp.To, resp.ID)
+	case "poll_vote":
+		fmt.Fprintf(os.Stdout, "Voted on %s in %s (id %s)\n", resp.Target, resp.To, resp.ID)
 	default:
 		fmt.Fprintf(os.Stdout, "Sent to %s (id %s)\n", resp.To, resp.ID)
 	}

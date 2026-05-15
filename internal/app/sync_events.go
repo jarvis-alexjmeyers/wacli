@@ -56,6 +56,13 @@ func (a *App) addSyncEventHandler(ctx context.Context, opts SyncOptions, message
 		switch v := evt.(type) {
 		case *events.Message:
 			lastEvent.Store(nowUTC().UnixNano())
+			if notif := historySyncNotificationFromMessage(v); notif != nil {
+				if notif.GetSyncType() == waE2E.HistorySyncType_ON_DEMAND {
+					return
+				}
+				a.downloadAndHandleHistorySync(ctx, opts, notif, messagesStored, lastEvent, enqueueMedia, limits)
+				return
+			}
 			a.handleLiveSyncMessage(ctx, opts, v, messagesStored, enqueueMedia, enqueueWebhook, limits)
 		case *events.HistorySync:
 			lastEvent.Store(nowUTC().UnixNano())
@@ -193,9 +200,34 @@ func (a *App) handleLiveSyncMessage(ctx context.Context, opts SyncOptions, v *ev
 		if enqueueWebhook != nil {
 			enqueueWebhook(pm)
 		}
+		sideEffectCtx := ctx
+		if ctx.Err() != nil {
+			sideEffectCtx = context.WithoutCancel(ctx)
+		}
+		a.handlePollSideEffects(sideEffectCtx, pm, v)
 	}
 	if opts.DownloadMedia && pm.Media != nil && pm.ID != "" {
 		enqueueMedia(pm.Chat.String(), pm.ID)
+	}
+}
+
+func (a *App) downloadAndHandleHistorySync(ctx context.Context, opts SyncOptions, notif *waE2E.HistorySyncNotification, messagesStored, lastEvent *atomic.Int64, enqueueMedia func(string, string), limits ...*syncStorageLimits) {
+	data, err := a.wa.DownloadHistorySync(ctx, notif)
+	if err != nil {
+		a.emitWarning(
+			"history_download_failed",
+			fmt.Sprintf("warning: failed to download history sync: %v", err),
+			map[string]any{"error": err.Error()},
+		)
+		return
+	}
+	a.handleHistorySync(ctx, opts, &events.HistorySync{Data: data}, messagesStored, lastEvent, enqueueMedia, limits...)
+	if err := a.wa.DeleteHistorySyncMedia(ctx, notif); err != nil {
+		a.emitWarning(
+			"history_delete_failed",
+			fmt.Sprintf("warning: failed to delete history sync media: %v", err),
+			map[string]any{"error": err.Error()},
+		)
 	}
 }
 
@@ -214,6 +246,7 @@ func (a *App) handleHistorySync(ctx context.Context, opts SyncOptions, v *events
 		if chatID == "" {
 			continue
 		}
+		var pendingPolls []historyPollSideEffect
 		for _, m := range conv.Messages {
 			lastEvent.Store(nowUTC().UnixNano())
 			if m.Message == nil {
@@ -222,6 +255,11 @@ func (a *App) handleHistorySync(ctx context.Context, opts SyncOptions, v *events
 			pm := wa.ParseHistoryMessage(chatID, m.Message)
 			if pm.ID == "" || pm.Chat.IsEmpty() {
 				continue
+			}
+			var pollEvt *events.Message
+			if normalized, evt, ok := a.normalizeHistoryPollMessage(pm, m.Message); ok {
+				pm = normalized
+				pollEvt = evt
 			}
 			if pm.ReactionToID != "" && pm.ReactionEmoji == "" && m.Message.GetMessage().GetEncReactionMessage() != nil {
 				evt, err := a.wa.ParseWebMessage(pm.Chat, m.Message)
@@ -237,13 +275,22 @@ func (a *App) handleHistorySync(ctx context.Context, opts SyncOptions, v *events
 			}
 			if err := a.storeParsedMessageForSync(ctx, pm, limits...); err == nil {
 				a.emitSyncProgress(messagesStored.Add(1))
+				if pm.Poll != nil || pm.PollAdd != nil || pm.PollVote != nil {
+					pendingPolls = append(pendingPolls, historyPollSideEffect{pm: pm, evt: pollEvt, hist: m.Message})
+				}
 			} else if ctx.Err() != nil {
+				a.handleHistoryPollSideEffectsBatch(context.WithoutCancel(ctx), pendingPolls)
 				return
 			}
 			if opts.DownloadMedia && pm.Media != nil && pm.ID != "" {
 				enqueueMedia(pm.Chat.String(), pm.ID)
 			}
 		}
+		flushCtx := ctx
+		if ctx.Err() != nil {
+			flushCtx = context.WithoutCancel(ctx)
+		}
+		a.handleHistoryPollSideEffectsBatch(flushCtx, pendingPolls)
 	}
 	if !a.eventsEnabled() {
 		a.emitOrPrint("progress", map[string]any{"messages_synced": messagesStored.Load()}, "\rSynced %d messages...", messagesStored.Load())

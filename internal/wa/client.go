@@ -238,6 +238,155 @@ func (c *Client) SendProtoMessageWithExtra(ctx context.Context, to types.JID, ms
 	return resp.ID, nil
 }
 
+// SendPoll builds a PollCreationMessage and sends it. selectable is the
+// maximum number of options a voter may pick (1 = single-select). The poll
+// can optionally be wrapped in an EphemeralMessage for disappearing chats.
+func (c *Client) SendPoll(ctx context.Context, to types.JID, name string, options []string, selectable int, ephemeral bool) (types.MessageID, error) {
+	c.mu.Lock()
+	cli := c.client
+	c.mu.Unlock()
+	if cli == nil || !cli.IsConnected() {
+		return "", fmt.Errorf("not connected")
+	}
+	msg := cli.BuildPollCreation(name, options, selectable)
+	if ephemeral {
+		msg = wrapEphemeralPollMessage(msg)
+	}
+	resp, err := cli.SendMessage(ctx, to, msg)
+	if err != nil {
+		return "", err
+	}
+	return resp.ID, nil
+}
+
+func wrapEphemeralPollMessage(msg *waE2E.Message) *waE2E.Message {
+	if msg == nil {
+		return nil
+	}
+	return &waE2E.Message{
+		EphemeralMessage:   &waE2E.FutureProofMessage{Message: msg},
+		MessageContextInfo: msg.MessageContextInfo,
+	}
+}
+
+// SendPollVote builds and sends a poll vote for the poll identified by
+// pollInfo (Chat, Sender, ID of the original PollCreationMessage). The
+// option names must match exactly the strings used in the poll.
+//
+// On migrated DM accounts, whatsmeow's SendMessage auto-rewrites the
+// destination from a phone-number JID to the corresponding LID. Pre-translate
+// DMs so the PollCreationMessageKey embedded by BuildPollVote matches the
+// chat/sender on the wire.
+func (c *Client) SendPollVote(ctx context.Context, pollInfo *types.MessageInfo, options []string) (types.MessageID, error) {
+	c.mu.Lock()
+	cli := c.client
+	c.mu.Unlock()
+	if cli == nil || !cli.IsConnected() {
+		return "", fmt.Errorf("not connected")
+	}
+	if pollInfo == nil {
+		return "", fmt.Errorf("poll info is required")
+	}
+
+	info := *pollInfo
+	info = rewritePollVoteInfoForLID(ctx, cli, info, c.resolvePNToLIDLocked)
+
+	msg, err := cli.BuildPollVote(ctx, &info, options)
+	if err != nil {
+		return "", fmt.Errorf("build poll vote: %w", err)
+	}
+	resp, err := cli.SendMessage(ctx, info.Chat, msg)
+	if err != nil {
+		return "", err
+	}
+	return resp.ID, nil
+}
+
+type pollVoteLIDResolver func(context.Context, *whatsmeow.Client, types.JID) types.JID
+
+func rewritePollVoteInfoForLID(ctx context.Context, cli *whatsmeow.Client, info types.MessageInfo, resolve pollVoteLIDResolver) types.MessageInfo {
+	if cli == nil || cli.Store == nil || cli.Store.LIDMigrationTimestamp <= 0 || resolve == nil {
+		return info
+	}
+	switch info.Chat.Server {
+	case types.DefaultUserServer:
+		info.Chat = resolve(ctx, cli, info.Chat)
+		if info.Sender.Server == types.DefaultUserServer {
+			info.Sender = resolve(ctx, cli, info.Sender)
+		}
+	case types.HiddenUserServer:
+		if info.Sender.Server == types.DefaultUserServer {
+			info.Sender = resolve(ctx, cli, info.Sender)
+		}
+	}
+	return info
+}
+
+// resolvePNToLIDLocked translates a phone-number JID to its LID counterpart
+// using the active session store; falls back to the input JID if no mapping
+// exists. Caller already holds (or doesn't need) c.mu.
+func (c *Client) resolvePNToLIDLocked(ctx context.Context, cli *whatsmeow.Client, jid types.JID) types.JID {
+	if cli == nil || cli.Store == nil {
+		return jid
+	}
+	pn := jid.ToNonAD()
+	if ownPN := cli.Store.GetJID().ToNonAD(); pn == ownPN {
+		if ownLID := cli.Store.GetLID().ToNonAD(); !ownLID.IsEmpty() {
+			return ownLID
+		}
+	}
+	if cli.Store.LIDs == nil {
+		return jid
+	}
+	lid, err := cli.Store.LIDs.GetLIDForPN(ctx, pn)
+	if err == nil && !lid.IsEmpty() {
+		return lid
+	}
+	info, err := cli.GetUserInfo(ctx, []types.JID{pn})
+	if err == nil {
+		if resolved := info[pn].LID.ToNonAD(); !resolved.IsEmpty() {
+			return resolved
+		}
+	}
+	return jid
+}
+
+// DecryptPollVote decrypts an incoming PollUpdateMessage event and returns
+// the SHA-256 hashes of the selected options. The caller is responsible for
+// matching those hashes back to option names.
+func (c *Client) DecryptPollVote(ctx context.Context, evt *events.Message) (*waE2E.PollVoteMessage, error) {
+	c.mu.Lock()
+	cli := c.client
+	c.mu.Unlock()
+	if cli == nil {
+		return nil, fmt.Errorf("whatsapp client is not initialized")
+	}
+	return cli.DecryptPollVote(ctx, evt)
+}
+
+func (c *Client) DecryptSecretEncryptedMessage(ctx context.Context, evt *events.Message) (*waE2E.Message, error) {
+	c.mu.Lock()
+	cli := c.client
+	c.mu.Unlock()
+	if cli == nil {
+		return nil, fmt.Errorf("whatsapp client is not initialized")
+	}
+	return cli.DecryptSecretEncryptedMessage(ctx, evt)
+}
+
+func (c *Client) DeleteHistorySyncMedia(ctx context.Context, notif *waE2E.HistorySyncNotification) error {
+	c.mu.Lock()
+	cli := c.client
+	c.mu.Unlock()
+	if cli == nil {
+		return fmt.Errorf("whatsapp client is not initialized")
+	}
+	if notif == nil || notif.GetDirectPath() == "" {
+		return nil
+	}
+	return cli.DeleteMedia(ctx, whatsmeow.MediaHistory, notif.GetDirectPath(), notif.GetFileEncSHA256(), notif.GetEncHandle())
+}
+
 func (c *Client) SendReaction(ctx context.Context, chat, sender types.JID, targetID types.MessageID, reaction string) (types.MessageID, error) {
 	c.mu.Lock()
 	cli := c.client
@@ -363,7 +512,7 @@ func (c *Client) DownloadHistorySync(ctx context.Context, notif *waE2E.HistorySy
 	if cli == nil {
 		return nil, fmt.Errorf("whatsapp client is not initialized")
 	}
-	return cli.DownloadHistorySync(ctx, notif, false)
+	return cli.DownloadHistorySync(ctx, notif, true)
 }
 
 func (c *Client) RequestHistorySyncOnDemand(ctx context.Context, lastKnown types.MessageInfo, count int) (types.MessageID, error) {
@@ -493,14 +642,7 @@ func (c *Client) ResolvePNToLID(ctx context.Context, jid types.JID) types.JID {
 	c.mu.Lock()
 	cli := c.client
 	c.mu.Unlock()
-	if cli == nil || cli.Store == nil || cli.Store.LIDs == nil {
-		return jid
-	}
-	lid, err := cli.Store.LIDs.GetLIDForPN(ctx, jid.ToNonAD())
-	if err != nil || lid.IsEmpty() {
-		return jid
-	}
-	return lid
+	return c.resolvePNToLIDLocked(ctx, cli, jid)
 }
 
 func BestContactName(info types.ContactInfo) string {
