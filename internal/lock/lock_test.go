@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -81,5 +82,40 @@ func TestAcquireWithTimeout(t *testing.T) {
 	}
 	if !errors.Is(err, ErrLocked) || !IsLocked(err) {
 		t.Fatalf("AcquireWithTimeout did not wrap ErrLocked: %v", err)
+	}
+}
+
+func TestAcquireWithTimeoutHonorsCanceledContext(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	lk, err := AcquireWithTimeout(ctx, dir, time.Second)
+	if err == nil {
+		_ = lk.Release()
+		t.Fatalf("AcquireWithTimeout acquired lock with canceled context")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("AcquireWithTimeout error = %v, want context.Canceled", err)
+	}
+}
+
+func TestAcquireWithTimeoutDoesNotRetryNonLockErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	_, err := AcquireWithTimeout(ctx, path, time.Hour)
+	if err == nil {
+		t.Fatalf("AcquireWithTimeout succeeded for file store path")
+	}
+	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "timed out waiting for store lock") {
+		t.Fatalf("AcquireWithTimeout retried non-lock error: %v", err)
+	}
+	if IsLocked(err) {
+		t.Fatalf("AcquireWithTimeout classified non-lock error as locked: %v", err)
 	}
 }

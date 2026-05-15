@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- CLI: honor canceled store-lock waits before acquiring locks and stop reporting non-contention lock failures as ordinary contention.
 - Media: sanitize `#`, control-wrapped blanks, and single-dot path components in generated media paths.
 - Store: remove starred-message metadata when deleting chat-local data so cleanup cannot leave stale starred state behind.
 

@@ -33,6 +33,9 @@ func Acquire(storeDir string) (*Lock, error) {
 		_, _ = f.Seek(0, 0)
 		b, _ := os.ReadFile(path)
 		_ = f.Close()
+		if !isLockContention(err) {
+			return nil, fmt.Errorf("lock file: %w", err)
+		}
 		info := strings.TrimSpace(string(b))
 		if info != "" {
 			return nil, fmt.Errorf("store is locked (another wacli is running?): %w: %w (%s)", ErrLocked, err, info)
@@ -49,6 +52,9 @@ func Acquire(storeDir string) (*Lock, error) {
 }
 
 func AcquireWithTimeout(ctx context.Context, storeDir string, wait time.Duration) (*Lock, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if wait <= 0 {
 		return Acquire(storeDir)
 	}
@@ -59,9 +65,15 @@ func AcquireWithTimeout(ctx context.Context, storeDir string, wait time.Duration
 
 	var lastErr error
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		lk, err := Acquire(storeDir)
 		if err == nil {
 			return lk, nil
+		}
+		if !IsLocked(err) {
+			return nil, err
 		}
 		lastErr = err
 		select {
