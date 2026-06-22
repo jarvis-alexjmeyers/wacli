@@ -82,7 +82,7 @@ func sqliteURI(path string, readOnly bool) string {
 			params += "&immutable=1"
 		}
 	}
-	return fmt.Sprintf("file:%s?%s", path, params)
+	return sqliteutil.FileURI(path, params)
 }
 
 func sqliteSidecarsExist(path string) bool {

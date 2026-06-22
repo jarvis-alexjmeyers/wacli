@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 
@@ -44,7 +45,7 @@ func readOnlySessionURI(path string) string {
 	if !sessionSQLiteSidecarsExist(path) {
 		params += "&immutable=1"
 	}
-	return fmt.Sprintf("file:%s?%s", path, params)
+	return (&url.URL{Scheme: "file", Path: path, RawQuery: params}).String()
 }
 
 func sessionSQLiteSidecarsExist(path string) bool {

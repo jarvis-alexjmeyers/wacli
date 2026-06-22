@@ -1,7 +1,10 @@
 package main
 
 import (
+	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	"go.mau.fi/whatsmeow/types"
 )
@@ -47,4 +50,17 @@ func TestChatKindFromJIDNewsletter(t *testing.T) {
 	if got != "newsletter" {
 		t.Fatalf("chatKindFromJID = %q", got)
 	}
+}
+
+func TestPersistChannelRecordsReturnsStoreError(t *testing.T) {
+	err := persistChannelRecords(failingChannelRecordStore{}, []channelRecord{{JID: "123@newsletter", Name: "News"}})
+	if err == nil || !strings.Contains(err.Error(), "persist channel 123@newsletter") || !strings.Contains(err.Error(), "write failed") {
+		t.Fatalf("persistChannelRecords err = %v, want wrapped store error", err)
+	}
+}
+
+type failingChannelRecordStore struct{}
+
+func (failingChannelRecordStore) UpsertChat(string, string, string, time.Time) error {
+	return errors.New("write failed")
 }

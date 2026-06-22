@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/openclaw/wacli/internal/out"
-	"github.com/openclaw/wacli/internal/store"
 	"github.com/openclaw/wacli/internal/wa"
 	"github.com/spf13/cobra"
 	"go.mau.fi/whatsmeow/types"
@@ -55,7 +54,9 @@ func newChannelsListCmd(flags *rootFlags) *cobra.Command {
 				return err
 			}
 			rows := channelRecords(list)
-			persistChannelRecords(a.DB(), rows)
+			if err := persistChannelRecords(a.DB(), rows); err != nil {
+				return err
+			}
 
 			if flags.asJSON {
 				return out.WriteJSON(os.Stdout, rows)
@@ -121,7 +122,9 @@ func newChannelsInfoCmd(flags *rootFlags) *cobra.Command {
 				return fmt.Errorf("channel not found")
 			}
 			row := channelRecordFromMeta(meta)
-			persistChannelRecords(a.DB(), []channelRecord{row})
+			if err := persistChannelRecords(a.DB(), []channelRecord{row}); err != nil {
+				return err
+			}
 
 			if flags.asJSON {
 				return out.WriteJSON(os.Stdout, row)
@@ -183,7 +186,9 @@ func newChannelsJoinCmd(flags *rootFlags) *cobra.Command {
 				return err
 			}
 			row := channelRecordFromMeta(meta)
-			persistChannelRecords(a.DB(), []channelRecord{row})
+			if err := persistChannelRecords(a.DB(), []channelRecord{row}); err != nil {
+				return err
+			}
 
 			if flags.asJSON {
 				return out.WriteJSON(os.Stdout, map[string]any{"joined": true, "channel": row})
@@ -282,11 +287,18 @@ func channelRecordFromMeta(meta *types.NewsletterMetadata) channelRecord {
 	return row
 }
 
-func persistChannelRecords(db *store.DB, rows []channelRecord) {
+type channelRecordStore interface {
+	UpsertChat(jid, kind, name string, lastTS time.Time) error
+}
+
+func persistChannelRecords(db channelRecordStore, rows []channelRecord) error {
 	now := time.Now().UTC()
 	for _, row := range rows {
-		_ = db.UpsertChat(row.JID, "newsletter", row.Name, now)
+		if err := db.UpsertChat(row.JID, "newsletter", row.Name, now); err != nil {
+			return fmt.Errorf("persist channel %s: %w", row.JID, err)
+		}
 	}
+	return nil
 }
 
 func parseChannelJID(raw string) (types.JID, error) {

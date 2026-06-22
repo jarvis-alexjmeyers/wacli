@@ -84,6 +84,12 @@ jobs:
               ;;
           esac
           mkdir -p "$HOME/.crabbox/actions"
+          case "$job" in
+            ''|*[!A-Za-z0-9._-]*)
+              echo "Invalid crabbox_job" >&2
+              exit 2
+              ;;
+          esac
           state="$HOME/.crabbox/actions/${CRABBOX_ID}.env"
           env_file="$HOME/.crabbox/actions/${CRABBOX_ID}.env.sh"
           {

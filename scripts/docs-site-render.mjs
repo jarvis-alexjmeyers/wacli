@@ -10,6 +10,7 @@ export function markdownToHtml(markdown, currentRel, rewriteHref) {
   let list = null;
   let fence = null;
   let blockquote = [];
+  const slugs = new Map();
 
   const flushParagraph = () => {
     if (!paragraph.length) return;
@@ -71,7 +72,7 @@ export function markdownToHtml(markdown, currentRel, rewriteHref) {
       closeList();
       const level = heading[1].length;
       const text = heading[2].trim();
-      const id = slug(text);
+      const id = uniqueSlug(slugs, text);
       const inner = inline(text, currentRel, rewriteHref);
       if (level === 1) {
         html.push(`<h1 id="${id}">${inner}</h1>`);
@@ -188,13 +189,13 @@ function inline(text, currentRel, rewriteHref) {
     return `\u0000${stash.length - 1}\u0000`;
   });
   out = escapeHtml(out)
+    .replace(/&lt;br&gt;/g, "<br>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|[^*])\*([^*\s][^*]*?)\*(?!\*)/g, "$1<em>$2</em>")
     .replace(/(^|[^_])_([^_\s][^_]*?)_(?!_)/g, "$1<em>$2</em>")
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, href) => `<a href="${escapeAttr(rewriteHref(href, currentRel))}">${label}</a>`)
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, href) => `<a href="${escapeAttr(rewriteHref(href, currentRel))}">${sanitizeLinkLabel(label)}</a>`)
     .replace(/&lt;(https?:\/\/[^\s<>]+)&gt;/g, '<a href="$1">$1</a>');
   out = out.replace(/\\\|/g, "|");
-  out = out.replace(/&lt;br&gt;/g, "<br>");
   return out.replace(/\u0000(\d+)\u0000/g, (_, i) => stash[Number(i)]);
 }
 
@@ -228,6 +229,22 @@ function isDivider(line) {
 
 function slug(text) {
   return text.toLowerCase().replace(/`/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+function uniqueSlug(slugs, text) {
+  const base = slug(text) || "section";
+  const count = (slugs.get(base) || 0) + 1;
+  slugs.set(base, count);
+  return count === 1 ? base : `${base}-${count}`;
+}
+
+function sanitizeLinkLabel(label) {
+  return label.replace(/<\/?(?:strong|em)>|[<>]/g, (match) => {
+    if (match === "<strong>" || match === "</strong>" || match === "<em>" || match === "</em>") {
+      return match;
+    }
+    return match === "<" ? "&lt;" : "&gt;";
+  });
 }
 
 function allHtml(dir) {

@@ -3,6 +3,7 @@ package sqliteutil
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -37,6 +38,16 @@ func TestChmodFilesIgnoresMissingSidecars(t *testing.T) {
 	}
 	if err := ChmodFiles(path, 0o600); err != nil {
 		t.Fatalf("ChmodFiles: %v", err)
+	}
+}
+
+func TestFileURIEscapesPathDelimiters(t *testing.T) {
+	uri := FileURI(filepath.Join(t.TempDir(), "store%3fprod", "session?prod#1.db"), "_foreign_keys=on")
+	if filepath.Base(uri) == "session?prod#1.db?_foreign_keys=on" {
+		t.Fatalf("FileURI = %q, want escaped URI delimiters", uri)
+	}
+	if !strings.Contains(uri, "store%253fprod/session%3Fprod%231.db?_foreign_keys=on") {
+		t.Fatalf("FileURI = %q, want escaped path with raw query", uri)
 	}
 }
 

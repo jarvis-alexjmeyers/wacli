@@ -136,6 +136,47 @@ func TestReadOnlyLocalResolverReadsSessionLIDMap(t *testing.T) {
 	assertNoAppSQLiteSidecars(t, sessionPath)
 }
 
+func TestReadOnlySessionURIEscapesPathDelimiters(t *testing.T) {
+	uri := readOnlySessionURI(filepath.Join(t.TempDir(), "session?prod#1.db"))
+	if strings.Contains(uri, "session?prod#1.db") {
+		t.Fatalf("readOnlySessionURI = %q, want escaped path delimiters", uri)
+	}
+	if !strings.Contains(uri, "session%3Fprod%231.db") {
+		t.Fatalf("readOnlySessionURI = %q, want escaped session filename", uri)
+	}
+	if !strings.Contains(uri, "?_foreign_keys=on") {
+		t.Fatalf("readOnlySessionURI = %q, want SQLite query params", uri)
+	}
+}
+
+func TestReadOnlyLocalResolverUsesExactPercentEscapedStorePath(t *testing.T) {
+	storeDir := filepath.Join(t.TempDir(), "store%3fprod%23one")
+	writer, err := New(Options{StoreDir: storeDir})
+	if err != nil {
+		t.Fatalf("New writer: %v", err)
+	}
+	writer.Close()
+
+	sessionPath := filepath.Join(storeDir, "session.db")
+	writeSessionLIDMap(t, sessionPath, "999123456789", "15551234567")
+
+	reader, err := New(Options{StoreDir: storeDir, ReadOnly: true})
+	if err != nil {
+		t.Fatalf("New read-only: %v", err)
+	}
+	defer reader.Close()
+
+	resolver, err := reader.LocalResolver()
+	if err != nil {
+		t.Fatalf("LocalResolver: %v", err)
+	}
+	lid := types.JID{User: "999123456789", Server: types.HiddenUserServer}
+	want := types.JID{User: "15551234567", Server: types.DefaultUserServer}
+	if got := resolver.ResolveLIDToPN(context.Background(), lid); got != want {
+		t.Fatalf("ResolveLIDToPN = %s, want %s", got, want)
+	}
+}
+
 func TestReadOnlyLocalResolverReadsOwnDeviceLID(t *testing.T) {
 	storeDir := t.TempDir()
 	writer, err := New(Options{StoreDir: storeDir})

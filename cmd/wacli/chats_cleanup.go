@@ -28,6 +28,9 @@ Use --days to adjust the threshold. Use --dry-run to preview what would be delet
 			if err := flags.requireWritable(); err != nil {
 				return err
 			}
+			if strings.TrimSpace(jid) == "" && days <= 0 {
+				return fmt.Errorf("--days must be greater than 0")
+			}
 
 			ctx, cancel := withTimeout(context.Background(), flags)
 			defer cancel()

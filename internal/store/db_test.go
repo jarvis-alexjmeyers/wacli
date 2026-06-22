@@ -29,6 +29,36 @@ func TestDBFilePermissions(t *testing.T) {
 	}
 }
 
+func TestOpenUsesExactPercentEscapedPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store%3fprod%23one", "wacli.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := db.UpsertChat("123@s.whatsapp.net", "direct", "Exact", nowUTC()); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("Stat exact db path: %v", err)
+	}
+
+	roDB, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	defer roDB.Close()
+	count, err := roDB.CountChats()
+	if err != nil {
+		t.Fatalf("CountChats: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("CountChats = %d, want exact DB row", count)
+	}
+}
+
 func TestOpenReadOnlyDoesNotCreateWALSidecars(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")

@@ -25,6 +25,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Setup Go
         uses: ./.github/actions/setup-ci-env
@@ -33,14 +34,6 @@ jobs:
 
       - name: Stash GoReleaser config
         run: cp .goreleaser.yaml /tmp/.goreleaser.yaml
-
-      - name: Checkout release tag
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        env:
-          RELEASE_TAG: ${{ inputs.tag }}
-        run: |
-          git fetch --tags --force
-          git checkout --detach "$RELEASE_TAG"
 
       - name: GoReleaser (macOS universal)
         uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6.4.0
@@ -123,6 +116,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Setup Go
         uses: ./.github/actions/setup-ci-env
@@ -132,14 +126,6 @@ jobs:
 
       - name: Stash GoReleaser config
         run: cp .goreleaser-linux-windows.yaml /tmp/.goreleaser-linux-windows.yaml
-
-      - name: Checkout release tag
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        env:
-          RELEASE_TAG: ${{ inputs.tag }}
-        run: |
-          git fetch --tags --force
-          git checkout --detach "$RELEASE_TAG"
 
       - name: GoReleaser (linux/windows)
         uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6.4.0

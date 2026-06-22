@@ -2,6 +2,7 @@ package sqliteutil
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 )
@@ -15,4 +16,8 @@ func ChmodFiles(path string, mode os.FileMode) error {
 		}
 	}
 	return nil
+}
+
+func FileURI(path, rawQuery string) string {
+	return (&url.URL{Scheme: "file", Path: path, RawQuery: rawQuery}).String()
 }
