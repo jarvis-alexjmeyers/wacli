@@ -27,5 +27,8 @@
     "crabbox:run": "crabbox run",
     "crabbox:stop": "crabbox stop",
     "crabbox:warmup": "crabbox warmup"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }
