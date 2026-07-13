@@ -423,6 +423,30 @@ func TestSendTextMessageRejectsUnconstructableQuotesBeforeSending(t *testing.T) 
 	}
 }
 
+func TestSendTextMessageAllowsUnsyncedGroupReplyWithSender(t *testing.T) {
+	db := openSendTestDB(t)
+	chat := types.JID{User: "12345", Server: types.GroupServer}
+	sender := &recordingTextSender{linkedJID: "15550000000@s.whatsapp.net"}
+
+	_, err := sendTextMessageWithSender(context.Background(), sender, db, chat, "reply", "quoted", "+15551234567", nil, nil, textEphemeralOptions{})
+	if err != nil {
+		t.Fatalf("sendTextMessageWithSender: %v", err)
+	}
+	if sender.protoCalls != 1 || sender.textCalls != 0 {
+		t.Fatalf("calls: SendText=%d SendProtoMessage=%d, want 0/1", sender.textCalls, sender.protoCalls)
+	}
+	info := requireExtendedText(t, sender.protoMsg).GetContextInfo()
+	if info.GetStanzaID() != "quoted" {
+		t.Fatalf("stanza ID = %q, want quoted", info.GetStanzaID())
+	}
+	if info.GetParticipant() != "15551234567@s.whatsapp.net" {
+		t.Fatalf("participant = %q", info.GetParticipant())
+	}
+	if info.GetQuotedMessage() != nil {
+		t.Fatalf("quoted message = %v, want nil without stored content", info.GetQuotedMessage())
+	}
+}
+
 func TestParseMentionedJIDs(t *testing.T) {
 	got, err := parseMentionedJIDs([]string{
 		" +1 (555) 123-4567 ",

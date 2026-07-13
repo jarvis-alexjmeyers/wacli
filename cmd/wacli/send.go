@@ -445,6 +445,16 @@ func buildTextReplyContextInfo(db *store.DB, chat types.JID, replyTo, replyToSen
 
 	quoted, err := db.GetMessage(chat.String(), replyTo)
 	if errors.Is(err, sql.ErrNoRows) {
+		if chat.Server == types.GroupServer && strings.TrimSpace(replyToSender) != "" {
+			participant, participantErr := resolveTextReplyParticipant(chat, store.Message{}, replyToSender, selfJID)
+			if participantErr != nil {
+				return nil, participantErr
+			}
+			return &waProto.ContextInfo{
+				StanzaID:    proto.String(replyTo),
+				Participant: proto.String(participant.String()),
+			}, nil
+		}
 		return nil, fmt.Errorf("quoted message %s not found in local store for chat %s; run `wacli sync` first", replyTo, chat.String())
 	}
 	if err != nil {
