@@ -201,6 +201,7 @@ type textMessageSender interface {
 	SendText(ctx context.Context, to types.JID, text string) (types.MessageID, error)
 	SendProtoMessage(ctx context.Context, to types.JID, msg *waProto.Message) (types.MessageID, error)
 	GetGroupInfo(ctx context.Context, jid types.JID) (*types.GroupInfo, error)
+	LinkedJID() string
 }
 
 type textEphemeralOptions struct {
@@ -222,7 +223,7 @@ func sendTextMessage(ctx context.Context, a sendTextApp, to types.JID, text, rep
 }
 
 func sendTextMessageWithSender(ctx context.Context, sender textMessageSender, db *store.DB, to types.JID, text, replyTo, replyToSender string, preview *linkpreview.Preview, mentionedJIDs []string, ephemeral textEphemeralOptions) (types.MessageID, error) {
-	msg, plainText, err := buildTextMessage(db, to, text, replyTo, replyToSender, preview, mentionedJIDs)
+	msg, plainText, err := buildTextMessageWithSelf(db, to, text, replyTo, replyToSender, sender.LinkedJID(), preview, mentionedJIDs)
 	if err != nil {
 		return "", err
 	}
@@ -380,7 +381,11 @@ func decodeMessageEscapes(s string) (string, error) {
 }
 
 func buildTextMessage(db *store.DB, to types.JID, text, replyTo, replyToSender string, preview *linkpreview.Preview, mentionedJIDs []string) (*waProto.Message, bool, error) {
-	info, err := buildTextContextInfo(db, to, replyTo, replyToSender, mentionedJIDs)
+	return buildTextMessageWithSelf(db, to, text, replyTo, replyToSender, "", preview, mentionedJIDs)
+}
+
+func buildTextMessageWithSelf(db *store.DB, to types.JID, text, replyTo, replyToSender, selfJID string, preview *linkpreview.Preview, mentionedJIDs []string) (*waProto.Message, bool, error) {
+	info, err := buildTextContextInfo(db, to, replyTo, replyToSender, selfJID, mentionedJIDs)
 	if err != nil {
 		return nil, false, err
 	}
@@ -417,8 +422,8 @@ func attachLinkPreview(msg *waProto.ExtendedTextMessage, preview *linkpreview.Pr
 	msg.PreviewType = waProto.ExtendedTextMessage_NONE.Enum()
 }
 
-func buildTextContextInfo(db *store.DB, chat types.JID, replyTo, replyToSender string, mentionedJIDs []string) (*waProto.ContextInfo, error) {
-	info, err := buildReplyContextInfo(db, chat, replyTo, replyToSender)
+func buildTextContextInfo(db *store.DB, chat types.JID, replyTo, replyToSender, selfJID string, mentionedJIDs []string) (*waProto.ContextInfo, error) {
+	info, err := buildTextReplyContextInfo(db, chat, replyTo, replyToSender, selfJID)
 	if err != nil {
 		return nil, err
 	}
@@ -430,6 +435,76 @@ func buildTextContextInfo(db *store.DB, chat types.JID, replyTo, replyToSender s
 	}
 	info.MentionedJID = append([]string(nil), mentionedJIDs...)
 	return info, nil
+}
+
+func buildTextReplyContextInfo(db *store.DB, chat types.JID, replyTo, replyToSender, selfJID string) (*waProto.ContextInfo, error) {
+	replyTo = strings.TrimSpace(replyTo)
+	if replyTo == "" {
+		return nil, nil
+	}
+
+	quoted, err := db.GetMessage(chat.String(), replyTo)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("quoted message %s not found in local store for chat %s; run `wacli sync` first", replyTo, chat.String())
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lookup quoted message: %w", err)
+	}
+	quotedMessage, err := storedTextQuotedMessage(quoted)
+	if err != nil {
+		return nil, fmt.Errorf("cannot quote message %s: %w", replyTo, err)
+	}
+	participant, err := resolveTextReplyParticipant(chat, quoted, replyToSender, selfJID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &waProto.ContextInfo{
+		StanzaID:      proto.String(replyTo),
+		Participant:   proto.String(participant.String()),
+		QuotedMessage: quotedMessage,
+	}, nil
+}
+
+func storedTextQuotedMessage(msg store.Message) (*waProto.Message, error) {
+	if msg.Revoked || msg.DeletedForMe {
+		return nil, fmt.Errorf("stored message was deleted")
+	}
+	if strings.TrimSpace(msg.MediaType) != "" || msg.ReactionToID != "" || len(msg.Buttons) > 0 {
+		return nil, fmt.Errorf("stored message content is not supported for quoted text replies")
+	}
+	if strings.TrimSpace(msg.Text) == "" {
+		return nil, fmt.Errorf("stored message has no supported text content")
+	}
+	return &waProto.Message{Conversation: proto.String(msg.Text)}, nil
+}
+
+func resolveTextReplyParticipant(chat types.JID, msg store.Message, override, selfJID string) (types.JID, error) {
+	if strings.TrimSpace(override) != "" {
+		jid, err := wa.ParseUserOrJID(override)
+		if err != nil {
+			return types.JID{}, fmt.Errorf("invalid --reply-to-sender: %w", err)
+		}
+		return jid, nil
+	}
+	if msg.FromMe {
+		jid, err := types.ParseJID(strings.TrimSpace(selfJID))
+		if err != nil || jid.IsEmpty() {
+			return types.JID{}, fmt.Errorf("linked account JID is unavailable for quoted outgoing message %s", msg.MsgID)
+		}
+		return jid.ToNonAD(), nil
+	}
+	if sender := strings.TrimSpace(msg.SenderJID); sender != "" {
+		jid, err := types.ParseJID(sender)
+		if err != nil {
+			return types.JID{}, fmt.Errorf("stored quoted sender is invalid: %w", err)
+		}
+		return jid, nil
+	}
+	if chat.Server != types.GroupServer {
+		return chat, nil
+	}
+	return types.JID{}, fmt.Errorf("--reply-to-sender is required because the stored group message has no sender")
 }
 
 func buildReplyContextInfo(db *store.DB, chat types.JID, replyTo, replyToSender string) (*waProto.ContextInfo, error) {
