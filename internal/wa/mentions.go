@@ -54,7 +54,13 @@ func canonicalJID(raw string) (string, bool) {
 		return "", false
 	}
 	switch jid.Server {
-	case types.DefaultUserServer, types.HiddenUserServer, types.LegacyUserServer:
+	case types.LegacyUserServer:
+		// "@c.us" is the LEGACY spelling of the phone-number namespace. It must FOLD into the modern
+		// one, or a legacy-shaped mention of us compares against "@s.whatsapp.net", misses, and is
+		// recorded as an authoritative `false` — a silent drop of a message that really did tag us.
+		jid.Server = types.DefaultUserServer
+		return jid.ToNonAD().String(), true
+	case types.DefaultUserServer, types.HiddenUserServer:
 		// ToNonAD strips the device/agent suffix, so 15551230000:5@... == 15551230000@...
 		return jid.ToNonAD().String(), true
 	default:
@@ -79,8 +85,15 @@ func (s SelfIdentity) matches(canonical string) bool {
 
 // DeriveMentionsMe reports whether this message addresses us, as a tri-state (TRUTH_TABLES T0/T1).
 //
-// nil means "a mention entity was present and we could not resolve it": quarantine it, do not guess.
+// nil means "a mention entity was present and we could not resolve it" — we make NO claim either way.
 // Collapsing nil to false is a silent drop; collapsing it to true is an unsolicited reply into a group.
+//
+// ⚠️ WHAT nil ACTUALLY DOES TODAY: it is persisted as NULL, stripped from the wire, and the backend
+// treats the message as an ordinary non-wake — i.e. exactly today's behaviour, no regression, but ALSO
+// NOT HELD. There is no durable quarantine/replay yet: an unresolved message is not parked for later
+// re-derivation, so if it really did address us, that wake is lost. The tri-state is the PRECONDITION
+// for a hold (we can now tell "not addressed" from "cannot tell"), not the hold itself.
+// Durable edge hold + replay is tracked separately — do not read "null" as "safely quarantined".
 func DeriveMentionsMe(ctx *waProto.ContextInfo, self SelfIdentity, isForwarded bool) *bool {
 	if ctx == nil {
 		return boolPtr(false)
@@ -153,7 +166,7 @@ func DeriveRepliesToMe(
 
 	canonical, ok := canonicalJID(ctx.GetParticipant())
 	if !ok {
-		return nil // unresolvable author claim: quarantine, do not lie in either direction
+		return nil // unresolvable author claim: make no claim, in either direction
 	}
 	if own := self.identityFor(canonical); own == "" {
 		return nil // the claim is in a namespace whose identity we do not know yet

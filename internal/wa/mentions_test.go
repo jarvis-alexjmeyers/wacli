@@ -13,6 +13,10 @@ import (
 //
 // The tri-state is load-bearing: nil means "a mention entity was present but we could not resolve it".
 // It must NEVER collapse to false (a silent drop) nor to true (an unsolicited reply into a group).
+//
+// NOTE: "null" here means "we cannot tell", NOT "safely held for replay". No durable quarantine exists
+// yet; an unresolved message currently behaves exactly as it does today (no wake). These tests prove
+// the DERIVATION, not a hold.
 
 const (
 	ownPN    = "15551230000@s.whatsapp.net"
@@ -83,7 +87,7 @@ func TestDeriveMentionsMe(t *testing.T) {
 		}, self(), false, no},
 
 		// 15: nonJIDMentions is a scalar COUNT of mentions with no JID. We cannot rule out that one
-		//     of them was us => unresolved => null + quarantine. Never false (that would be a lie).
+		//     of them was us => unresolved => null. Never false (that would be a lie).
 		{"15", &waProto.ContextInfo{NonJIDMentions: proto.Uint32(1)}, self(), false, nil},
 
 		// 19: our own identity is not fully known (store not ready / mid-relink). A mention is
@@ -110,6 +114,12 @@ func TestDeriveMentionsMe(t *testing.T) {
 		// A PN and a LID with the SAME numeric user part are DIFFERENT principals. Comparing bare
 		// user parts (as the throwaway probe did) would false-positive here.
 		{"canon-namespace", ctxWith("99887766554433@s.whatsapp.net"), self(), false, no},
+
+		// LEGACY "@c.us" is the same phone-number namespace as "@s.whatsapp.net". If it does not fold,
+		// a legacy-shaped mention of US compares against the modern PN, misses, and is recorded as an
+		// authoritative `false` -- silently dropping a message that really did tag us.
+		{"canon-legacy-c.us", ctxWith("15551230000@c.us"), self(), false, yes},
+		{"canon-legacy-other", ctxWith("15559990000@c.us"), self(), false, no},
 	}
 
 	for _, tc := range cases {
@@ -148,7 +158,7 @@ func TestDeriveRepliesToMe(t *testing.T) {
 		{"R2-pn", reply(ownPN), ReplyProofAuthoredByUs, false, yes},
 
 		// R3: 🔴 THE FORGERY VECTOR. The message CLAIMS to quote us, but we have no local record of
-		//     ever sending it. Absence of proof => null + quarantine. NEVER true: a `true` here lets
+		//     ever sending it. Absence of proof => null. NEVER true: a `true` here lets
 		//     anyone forge reply metadata and make Wave reply into a group on demand.
 		{"R3", reply(ownLID), ReplyProofAbsent, false, nil},
 
@@ -162,7 +172,7 @@ func TestDeriveRepliesToMe(t *testing.T) {
 		// R7: a FORWARDED copy of a reply-to-Wave carries stale reply metadata => must not wake.
 		{"R7", reply(ownLID), ReplyProofAuthoredByUs, true, no},
 
-		// R8: the participant is unresolvable => null + quarantine, no wake, no lie.
+		// R8: the participant is unresolvable => null, no wake, no lie.
 		{"R8", reply("not-a-jid"), ReplyProofAbsent, false, nil},
 	}
 
@@ -174,7 +184,7 @@ func TestDeriveRepliesToMe(t *testing.T) {
 	}
 }
 
-// A quarantined (null) value must be distinguishable from a false one all the way out to the wire.
+// An unresolved (null) value must be distinguishable from a false one all the way out to the wire.
 // Collapsing null -> false is the silent-drop bug; collapsing null -> true is the forgery.
 func TestTriStateIsNotCollapsed(t *testing.T) {
 	if got := DeriveMentionsMe(&waProto.ContextInfo{NonJIDMentions: proto.Uint32(2)}, self(), false); got != nil {
