@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -548,4 +549,31 @@ func boolPtrToNullInt64(v *bool) sql.NullInt64 {
 		n = 1
 	}
 	return sql.NullInt64{Int64: n, Valid: true}
+}
+
+// MessageAuthorship reports whether we hold a local record of a message, and whether WE wrote it.
+//
+// This is the proof behind RepliesToMe (AITOOLS-927). ContextInfo.participant is an attacker-supplied
+// CLAIM that Wave authored the quoted message; only our own store can corroborate it. Keyed on
+// (chat_jid, msg_id) — never msg_id alone, or the same id in a DIFFERENT chat would forge the proof.
+//
+// found=false means "no record", which the caller must treat as UNRESOLVED (null + quarantine), never
+// as a confirmed authorship and never as a confirmed denial.
+func (d *DB) MessageAuthorship(chatJID, msgID string) (found bool, fromMe bool, err error) {
+	chatJID = strings.TrimSpace(chatJID)
+	msgID = strings.TrimSpace(msgID)
+	if chatJID == "" || msgID == "" {
+		return false, false, nil
+	}
+	var fm int64
+	err = d.sql.QueryRow(
+		`SELECT from_me FROM messages WHERE chat_jid = ? AND msg_id = ?`, chatJID, msgID,
+	).Scan(&fm)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	return true, fm != 0, nil
 }
