@@ -95,7 +95,7 @@ func TestDeriveMentionsMe(t *testing.T) {
 		{"19", ctxWith(otherLID), SelfIdentity{PN: ownPN}, false, nil},
 
 		// 19b: identity unknown BUT the mentioned namespace matches the identity we DO know, and it
-		//      is us — decide on what we know rather than quarantining a certainty.
+		//      is us — decide on what we know rather than withholding a certainty.
 		{"19b", ctxWith(ownPN), SelfIdentity{PN: ownPN}, false, yes},
 
 		// 20: multiple entities reduce through T0: any self-match wins.
@@ -188,7 +188,7 @@ func TestDeriveRepliesToMe(t *testing.T) {
 // Collapsing null -> false is the silent-drop bug; collapsing null -> true is the forgery.
 func TestTriStateIsNotCollapsed(t *testing.T) {
 	if got := DeriveMentionsMe(&waProto.ContextInfo{NonJIDMentions: proto.Uint32(2)}, self(), false); got != nil {
-		t.Fatalf("an unresolved mention collapsed to %s; it must stay null (quarantine)", tri(got))
+		t.Fatalf("an unresolved mention collapsed to %s; it must stay null (we cannot tell)", tri(got))
 	}
 	if got := DeriveRepliesToMe(
 		&waProto.ContextInfo{StanzaID: proto.String("x"), Participant: proto.String(ownLID)},

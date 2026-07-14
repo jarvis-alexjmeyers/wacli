@@ -529,7 +529,7 @@ func messageInfoFromLatestRow(row storedb.GetLatestMessageInfoRow) MessageInfo {
 
 // nullInt64ToBoolPtr maps a nullable SQLite integer to a tri-state bool.
 //
-// NULL -> nil (unknown / quarantined), NOT false. Collapsing NULL to false would assert "you were not
+// NULL -> nil (unknown), NOT false. Collapsing NULL to false would assert "you were not
 // addressed" about a message we never managed to examine.
 func nullInt64ToBoolPtr(v sql.NullInt64) *bool {
 	if !v.Valid {
@@ -557,8 +557,9 @@ func boolPtrToNullInt64(v *bool) sql.NullInt64 {
 // CLAIM that Wave authored the quoted message; only our own store can corroborate it. Keyed on
 // (chat_jid, msg_id) — never msg_id alone, or the same id in a DIFFERENT chat would forge the proof.
 //
-// found=false means "no record", which the caller must treat as UNRESOLVED (null + quarantine), never
-// as a confirmed authorship and never as a confirmed denial.
+// found=false means "no record", which the caller must treat as UNRESOLVED (null) — never as a
+// confirmed authorship and never as a confirmed denial. (Unresolved is not "held for replay": no
+// durable hold exists yet.)
 func (d *DB) MessageAuthorship(chatJID, msgID string) (found bool, fromMe bool, err error) {
 	chatJID = strings.TrimSpace(chatJID)
 	msgID = strings.TrimSpace(msgID)

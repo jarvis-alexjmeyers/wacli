@@ -133,7 +133,7 @@ func TestSyncRefusesForgedReply(t *testing.T) {
 	got := storeMsg(t, a, "M-FORGED")
 	if got.RepliesToMe != nil {
 		t.Errorf(
-			"RepliesToMe = %s on a FORGED reply with no local proof; want null (quarantine). "+
+			"RepliesToMe = %s on a FORGED reply with no local proof; want null (no claim). "+
 				"A true here is a remote-triggered wake: anyone could forge a stanza id and make Wave "+
 				"reply into a group.",
 			triS(got.RepliesToMe),
@@ -193,7 +193,9 @@ func TestSyncOrdinaryMessageRecordsFalse(t *testing.T) {
 
 // RELINK: our LID rotated, so the mention names an identity we no longer recognise. That is UNKNOWN,
 // not false — a false would silently drop a message that may well have addressed us.
-func TestSyncRelinkedIdentityQuarantinesRatherThanDrops(t *testing.T) {
+//
+// NOTE: "unknown" is NOT "held". Nothing parks this message for replay yet; it simply makes no claim.
+func TestSyncRelinkedIdentityStaysUnknownRatherThanDrops(t *testing.T) {
 	a := newAddressingApp(t)
 	f := newFakeWA()
 	f.linkedLID = "" // mid-relink: the LID is not resolvable yet

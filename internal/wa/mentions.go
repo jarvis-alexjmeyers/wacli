@@ -124,7 +124,7 @@ func DeriveMentionsMe(ctx *waProto.ContextInfo, self SelfIdentity, isForwarded b
 			continue
 		}
 		// A self-match is decisive even when the other entities are unresolvable, and even when only
-		// one of our own identities is known — we are certain, so there is nothing to quarantine.
+		// one of our own identities is known — we are certain, so there is nothing to withhold.
 		if self.matches(canonical) {
 			return boolPtr(true)
 		}
