@@ -171,12 +171,14 @@ DELETE FROM groups WHERE left_at IS NOT NULL AND left_at < ?;
 INSERT INTO messages(
     chat_jid, chat_name, msg_id, sender_jid, sender_name, ts, from_me, text, display_text,
     quoted_msg_id, quoted_sender_jid,
+    mentions_me, replies_to_me,
     is_forwarded, forwarding_score, reaction_to_id, reaction_emoji,
     media_type, media_caption, filename, mime_type, direct_path,
     media_key, file_sha256, file_enc_sha256, file_length, revoked, deleted_for_me, edited, edited_ts, buttons
 ) VALUES (
     ?, ?, ?, ?, ?,
     ?, ?, ?, ?,
+    ?, ?,
     ?, ?,
     ?, ?, ?, ?,
     ?, ?, ?, ?, ?,
@@ -193,6 +195,8 @@ ON CONFLICT(chat_jid, msg_id) DO UPDATE SET
     display_text=CASE WHEN excluded.deleted_for_me != 0 THEN excluded.display_text WHEN messages.deleted_for_me != 0 THEN messages.display_text WHEN excluded.revoked != 0 THEN excluded.display_text WHEN messages.revoked != 0 THEN messages.display_text WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.display_text WHEN excluded.display_text IS NOT NULL AND excluded.display_text != '' THEN excluded.display_text ELSE messages.display_text END,
     quoted_msg_id=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.quoted_msg_id ELSE COALESCE(NULLIF(excluded.quoted_msg_id,''), messages.quoted_msg_id) END,
     quoted_sender_jid=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.quoted_sender_jid ELSE COALESCE(NULLIF(excluded.quoted_sender_jid,''), messages.quoted_sender_jid) END,
+    mentions_me=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN ((messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts)) THEN messages.mentions_me WHEN excluded.mentions_me IS NULL THEN messages.mentions_me ELSE excluded.mentions_me END,
+    replies_to_me=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN ((messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts)) THEN messages.replies_to_me WHEN excluded.replies_to_me IS NULL THEN messages.replies_to_me ELSE excluded.replies_to_me END,
     is_forwarded=CASE WHEN ((messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts)) AND messages.revoked = 0 AND messages.deleted_for_me = 0 AND excluded.revoked = 0 AND excluded.deleted_for_me = 0 THEN messages.is_forwarded ELSE excluded.is_forwarded END,
     forwarding_score=CASE WHEN ((messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts)) AND messages.revoked = 0 AND messages.deleted_for_me = 0 AND excluded.revoked = 0 AND excluded.deleted_for_me = 0 THEN messages.forwarding_score ELSE excluded.forwarding_score END,
     reaction_to_id=CASE WHEN ((messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts)) AND messages.revoked = 0 AND messages.deleted_for_me = 0 AND excluded.revoked = 0 AND excluded.deleted_for_me = 0 THEN messages.reaction_to_id ELSE COALESCE(NULLIF(excluded.reaction_to_id,''), messages.reaction_to_id) END,

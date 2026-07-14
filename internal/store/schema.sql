@@ -68,6 +68,11 @@ CREATE TABLE IF NOT EXISTS messages (
     display_text TEXT,
     quoted_msg_id TEXT,
     quoted_sender_jid TEXT,
+    -- AITOOLS-927: provider addressing, TRI-STATE. NULL = unresolved (quarantine), NOT false.
+    -- Nullable with NO default: a `false` default would be an authoritative "you were not
+    -- addressed" on every pre-existing row, which is the silent drop we are fixing.
+    mentions_me INTEGER,
+    replies_to_me INTEGER,
     is_forwarded INTEGER NOT NULL DEFAULT 0,
     forwarding_score INTEGER NOT NULL DEFAULT 0,
     reaction_to_id TEXT,

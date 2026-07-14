@@ -34,6 +34,36 @@ var schemaMigrations = []migration{
 	{version: 18, name: "chat unread count column", up: migrateChatUnreadCountColumn},
 	{version: 19, name: "messages quoted columns", up: migrateMessagesQuotedColumns},
 	{version: 20, name: "messages media_unavailable_at column", up: migrateMessagesMediaUnavailableColumn},
+	{version: 21, name: "messages provider addressing columns", up: migrateMessagesProviderAddressingColumns},
+}
+
+// migrateMessagesProviderAddressingColumns adds the AITOOLS-927 tri-state columns.
+//
+// NULLABLE, and deliberately WITHOUT a default. Every row that already exists — the entire deployed
+// v0.11.2 store — becomes NULL = "we never derived this", which is the truth. A `NOT NULL DEFAULT 0`
+// would instead assert "this message did not mention you" about millions of rows we never examined,
+// turning an unknown into an authoritative false: the exact silent drop this ticket exists to fix.
+func migrateMessagesProviderAddressingColumns(d *DB) error {
+	hasTable, err := d.tableExists("messages")
+	if err != nil {
+		return err
+	}
+	if !hasTable {
+		return nil
+	}
+	for _, col := range []string{"mentions_me", "replies_to_me"} {
+		has, err := d.tableHasColumn("messages", col)
+		if err != nil {
+			return err
+		}
+		if has {
+			continue // idempotent: an interrupted migration re-runs safely
+		}
+		if _, err := d.sql.Exec(`ALTER TABLE messages ADD COLUMN ` + col + ` INTEGER`); err != nil {
+			return fmt.Errorf("add messages.%s column: %w", col, err)
+		}
+	}
+	return nil
 }
 
 func migrateMessagesMediaUnavailableColumn(d *DB) error {

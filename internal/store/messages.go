@@ -39,10 +39,13 @@ type UpsertMessageParams struct {
 	Edited          bool
 	Revoked         bool
 	DeletedForMe    bool
+	// TRI-STATE: nil = we could not derive it. Never persisted as a bare false.
+	MentionsMe  *bool
+	RepliesToMe *bool
 }
 
 func messageSelectColumns(snippet string) string {
-	return fmt.Sprintf(`m.rowid, m.chat_jid, COALESCE(c.name,''), m.msg_id, COALESCE(m.sender_jid,''), COALESCE(m.sender_name,''), m.ts, m.from_me, COALESCE(m.text,''), COALESCE(m.display_text,''), COALESCE(m.quoted_msg_id,''), COALESCE(m.quoted_sender_jid,''), m.is_forwarded, m.forwarding_score, COALESCE(m.reaction_to_id,''), COALESCE(m.reaction_emoji,''), COALESCE(m.media_type,''), COALESCE(m.media_caption,''), COALESCE(m.filename,''), COALESCE(m.mime_type,''), COALESCE(m.direct_path,''), COALESCE(m.local_path,''), COALESCE(m.downloaded_at,0), CASE WHEN s.msg_id IS NULL THEN 0 ELSE 1 END, COALESCE(s.starred_at,0), m.revoked, m.deleted_for_me, COALESCE(m.buttons,''), %s`, snippetSQL(snippet))
+	return fmt.Sprintf(`m.rowid, m.chat_jid, COALESCE(c.name,''), m.msg_id, COALESCE(m.sender_jid,''), COALESCE(m.sender_name,''), m.ts, m.from_me, COALESCE(m.text,''), COALESCE(m.display_text,''), COALESCE(m.quoted_msg_id,''), COALESCE(m.quoted_sender_jid,''), m.mentions_me, m.replies_to_me, m.is_forwarded, m.forwarding_score, COALESCE(m.reaction_to_id,''), COALESCE(m.reaction_emoji,''), COALESCE(m.media_type,''), COALESCE(m.media_caption,''), COALESCE(m.filename,''), COALESCE(m.mime_type,''), COALESCE(m.direct_path,''), COALESCE(m.local_path,''), COALESCE(m.downloaded_at,0), CASE WHEN s.msg_id IS NULL THEN 0 ELSE 1 END, COALESCE(s.starred_at,0), m.revoked, m.deleted_for_me, COALESCE(m.buttons,''), %s`, snippetSQL(snippet))
 }
 
 func snippetSQL(snippet string) string {
@@ -95,6 +98,8 @@ func (d *DB) UpsertMessage(p UpsertMessageParams) error {
 		DisplayText:     nullString(p.DisplayText),
 		QuotedMsgID:     nullString(p.QuotedMsgID),
 		QuotedSenderJid: nullString(p.QuotedSenderJID),
+		MentionsMe:      boolPtrToNullInt64(p.MentionsMe),
+		RepliesToMe:     boolPtrToNullInt64(p.RepliesToMe),
 		IsForwarded:     boolToInt64(p.IsForwarded),
 		ForwardingScore: int64(p.ForwardingScore),
 		ReactionToID:    nullString(p.ReactionToID),
@@ -404,10 +409,15 @@ func (d *DB) scanMessages(query string, args ...interface{}) ([]Message, error) 
 		var revoked int
 		var deletedForMe int
 		var buttonsJSON string
-		if err := rows.Scan(&m.rowID, &m.ChatJID, &m.ChatName, &m.MsgID, &m.SenderJID, &m.SenderName, &ts, &fromMe, &m.Text, &m.DisplayText, &m.QuotedMsgID, &m.QuotedSenderJID, &forwarded, &forwardingScore, &m.ReactionToID, &m.ReactionEmoji, &m.MediaType, &m.MediaCaption, &m.Filename, &m.MimeType, &m.DirectPath, &m.LocalPath, &downloadedAt, &starred, &starredAt, &revoked, &deletedForMe, &buttonsJSON, &m.Snippet); err != nil {
+		var mentionsMe sql.NullInt64
+		var repliesToMe sql.NullInt64
+		if err := rows.Scan(&m.rowID, &m.ChatJID, &m.ChatName, &m.MsgID, &m.SenderJID, &m.SenderName, &ts, &fromMe, &m.Text, &m.DisplayText, &m.QuotedMsgID, &m.QuotedSenderJID, &mentionsMe, &repliesToMe, &forwarded, &forwardingScore, &m.ReactionToID, &m.ReactionEmoji, &m.MediaType, &m.MediaCaption, &m.Filename, &m.MimeType, &m.DirectPath, &m.LocalPath, &downloadedAt, &starred, &starredAt, &revoked, &deletedForMe, &buttonsJSON, &m.Snippet); err != nil {
 			return nil, err
 		}
 		m.Timestamp = fromUnix(ts)
+		// NULL stays nil (unknown), never false. SQLite has no bool: 0/1 -> *bool.
+		m.MentionsMe = nullInt64ToBoolPtr(mentionsMe)
+		m.RepliesToMe = nullInt64ToBoolPtr(repliesToMe)
 		m.FromMe = fromMe != 0
 		m.IsForwarded = forwarded != 0
 		m.ForwardingScore = uint32(forwardingScore)
@@ -514,4 +524,28 @@ func messageInfoFromLatestRow(row storedb.GetLatestMessageInfoRow) MessageInfo {
 		SenderJID:  row.SenderJid,
 		SenderName: row.SenderName,
 	}
+}
+
+// nullInt64ToBoolPtr maps a nullable SQLite integer to a tri-state bool.
+//
+// NULL -> nil (unknown / quarantined), NOT false. Collapsing NULL to false would assert "you were not
+// addressed" about a message we never managed to examine.
+func nullInt64ToBoolPtr(v sql.NullInt64) *bool {
+	if !v.Valid {
+		return nil
+	}
+	b := v.Int64 != 0
+	return &b
+}
+
+// boolPtrToNullInt64 maps a tri-state bool to a nullable SQLite integer (nil -> NULL).
+func boolPtrToNullInt64(v *bool) sql.NullInt64 {
+	if v == nil {
+		return sql.NullInt64{}
+	}
+	n := int64(0)
+	if *v {
+		n = 1
+	}
+	return sql.NullInt64{Int64: n, Valid: true}
 }
