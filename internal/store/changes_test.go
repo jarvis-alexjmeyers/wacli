@@ -119,6 +119,61 @@ func TestMessageChangeKindsAndIdempotentUpsert(t *testing.T) {
 	}
 }
 
+func TestMessageChangesCarryProviderAddressingTriState(t *testing.T) {
+	db := openTestDB(t)
+	chat := "addressing@s.whatsapp.net"
+	ts := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	if err := db.UpsertChat(chat, "dm", "Addressing", ts); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	mentionsMe := true
+	repliesToMe := false
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID:     chat,
+		MsgID:       "derived",
+		Timestamp:   ts,
+		MentionsMe:  &mentionsMe,
+		RepliesToMe: &repliesToMe,
+	}); err != nil {
+		t.Fatalf("derived insert: %v", err)
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID:   chat,
+		MsgID:     "underived",
+		Timestamp: ts,
+	}); err != nil {
+		t.Fatalf("underived insert: %v", err)
+	}
+
+	page, err := db.ListMessageChanges(0, 10)
+	if err != nil {
+		t.Fatalf("ListMessageChanges: %v", err)
+	}
+	if len(page.Changes) != 2 {
+		t.Fatalf("changes = %d, want 2", len(page.Changes))
+	}
+	derived := page.Changes[0].Message
+	if derived == nil {
+		t.Fatal("derived change message is nil")
+	}
+	if derived.MentionsMe == nil || !*derived.MentionsMe {
+		t.Fatalf("derived MentionsMe = %s, want true", tri(derived.MentionsMe))
+	}
+	if derived.RepliesToMe == nil || *derived.RepliesToMe {
+		t.Fatalf("derived RepliesToMe = %s, want false", tri(derived.RepliesToMe))
+	}
+	underived := page.Changes[1].Message
+	if underived == nil {
+		t.Fatal("underived change message is nil")
+	}
+	if underived.MentionsMe != nil || underived.RepliesToMe != nil {
+		t.Fatalf(
+			"underived addressing = MentionsMe:%s RepliesToMe:%s, want both null",
+			tri(underived.MentionsMe), tri(underived.RepliesToMe),
+		)
+	}
+}
+
 func TestEveryExportedMessageMutationEmitsItsChangeKind(t *testing.T) {
 	db := openTestDB(t)
 	chat := "mutations@s.whatsapp.net"

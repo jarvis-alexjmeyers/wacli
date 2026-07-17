@@ -56,6 +56,77 @@ func TestChangesListCommandWritesStandardJSONEnvelopeReadOnly(t *testing.T) {
 	}
 }
 
+func TestChangesListCommandPreservesProviderAddressingTriStateJSON(t *testing.T) {
+	storeDir := t.TempDir()
+	db, err := store.Open(filepath.Join(storeDir, "wacli.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	chat := "changes-addressing@s.whatsapp.net"
+	now := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	if err := db.UpsertChat(chat, "dm", "Addressing", now); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	mentionsMe := true
+	repliesToMe := false
+	if err := db.UpsertMessage(store.UpsertMessageParams{
+		ChatJID:     chat,
+		MsgID:       "derived",
+		Timestamp:   now,
+		MentionsMe:  &mentionsMe,
+		RepliesToMe: &repliesToMe,
+	}); err != nil {
+		t.Fatalf("derived insert: %v", err)
+	}
+	if err := db.UpsertMessage(store.UpsertMessageParams{
+		ChatJID:   chat,
+		MsgID:     "underived",
+		Timestamp: now,
+	}); err != nil {
+		t.Fatalf("underived insert: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	flags := &rootFlags{storeDir: storeDir, asJSON: true, readOnly: true, timeout: time.Minute}
+	raw := captureRootStdout(t, func() {
+		cmd := newChangesListCmd(flags)
+		cmd.SetArgs([]string{"--after-seq", "0", "--limit", "10"})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("changes list: %v", err)
+		}
+	})
+	var envelope struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Changes []struct {
+				Message map[string]json.RawMessage `json:"message"`
+			} `json:"changes"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !envelope.Success || len(envelope.Data.Changes) != 2 {
+		t.Fatalf("changes response success=%v count=%d, want true/2", envelope.Success, len(envelope.Data.Changes))
+	}
+	derived := envelope.Data.Changes[0].Message
+	if got := string(derived["MentionsMe"]); got != "true" {
+		t.Fatalf("derived MentionsMe JSON = %q, want true", got)
+	}
+	if got := string(derived["RepliesToMe"]); got != "false" {
+		t.Fatalf("derived RepliesToMe JSON = %q, want false", got)
+	}
+	underived := envelope.Data.Changes[1].Message
+	if _, ok := underived["MentionsMe"]; ok {
+		t.Fatal("underived message fabricated MentionsMe instead of omitting unknown tri-state")
+	}
+	if _, ok := underived["RepliesToMe"]; ok {
+		t.Fatal("underived message fabricated RepliesToMe instead of omitting unknown tri-state")
+	}
+}
+
 func TestChangesStatusCommandEmptyStoreBootstrapIsZero(t *testing.T) {
 	storeDir := t.TempDir()
 	db, err := store.Open(filepath.Join(storeDir, "wacli.db"))

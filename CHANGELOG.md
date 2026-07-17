@@ -11,6 +11,13 @@
 
 - Store: normalize Windows drive paths before generating SQLite file URIs to prevent invalid URI authority errors. (#304 - thanks @goutamadwant)
 
+## 0.12.1-wave.938 - 2026-07-17
+
+### Fixed
+
+- Changes: preserve nullable `MentionsMe` and `RepliesToMe` values in change-stream message objects after combining the AITOOLS-927 and AITOOLS-938 store migrations.
+- Build: pin Wave's AITOOLS-938 artifact version to `0.12.1-wave.938`.
+
 ## 0.12.1 - 2026-07-09
 
 ### Added

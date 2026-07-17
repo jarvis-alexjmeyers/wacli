@@ -112,6 +112,157 @@ func TestOpenCreatesExpectedSchema(t *testing.T) {
 	}
 }
 
+func TestFreshStoreRunsMigrationsThrough22AndMatchesEmbeddedMessageSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wacli.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open fresh: %v", err)
+	}
+	defer db.Close()
+
+	rows, err := db.sql.Query(`SELECT version, name FROM schema_migrations ORDER BY version`)
+	if err != nil {
+		t.Fatalf("read schema migrations: %v", err)
+	}
+	defer rows.Close()
+	for index, want := range schemaMigrations {
+		if !rows.Next() {
+			t.Fatalf("schema migrations stopped at %d, want migration %d", index, want.version)
+		}
+		var version int
+		var name string
+		if err := rows.Scan(&version, &name); err != nil {
+			t.Fatalf("scan schema migration: %v", err)
+		}
+		if version != want.version || name != want.name {
+			t.Fatalf("schema migration %d = (%d, %q), want (%d, %q)", index, version, name, want.version, want.name)
+		}
+	}
+	if rows.Next() {
+		t.Fatal("fresh store recorded an unexpected migration after 22")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate schema migrations: %v", err)
+	}
+
+	reference, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "schema-reference.db"))
+	if err != nil {
+		t.Fatalf("open schema reference: %v", err)
+	}
+	defer reference.Close()
+	if _, err := reference.Exec(coreSchemaSQL); err != nil {
+		t.Fatalf("apply embedded schema: %v", err)
+	}
+	schemaRows, err := reference.Query(`
+		SELECT type, name, sql
+		FROM sqlite_schema
+		WHERE type IN ('table', 'index') AND sql IS NOT NULL
+		ORDER BY type, name
+	`)
+	if err != nil {
+		t.Fatalf("read embedded schema objects: %v", err)
+	}
+	for schemaRows.Next() {
+		var objectType string
+		var name string
+		var wantSQL string
+		if err := schemaRows.Scan(&objectType, &name, &wantSQL); err != nil {
+			_ = schemaRows.Close()
+			t.Fatalf("scan embedded schema object: %v", err)
+		}
+		var gotSQL string
+		if err := db.sql.QueryRow(`SELECT sql FROM sqlite_schema WHERE type = ? AND name = ?`, objectType, name).Scan(&gotSQL); err != nil {
+			_ = schemaRows.Close()
+			t.Fatalf("read fresh schema object %s %s: %v", objectType, name, err)
+		}
+		if gotSQL != wantSQL {
+			_ = schemaRows.Close()
+			t.Fatalf("fresh schema object %s %s does not match schema.sql", objectType, name)
+		}
+	}
+	if err := schemaRows.Err(); err != nil {
+		_ = schemaRows.Close()
+		t.Fatalf("iterate embedded schema objects: %v", err)
+	}
+	if err := schemaRows.Close(); err != nil {
+		t.Fatalf("close embedded schema objects: %v", err)
+	}
+	if got := countRows(t, db.sql, `
+		SELECT COUNT(*)
+		FROM pragma_table_info('messages')
+		WHERE name IN ('mentions_me', 'replies_to_me')
+		  AND "notnull" = 0
+		  AND dflt_value IS NULL
+	`); got != 2 {
+		t.Fatalf("nullable provider-addressing columns without defaults = %d, want 2", got)
+	}
+}
+
+func TestMigration22UpgradesMigration21StoreWithoutFabricatingFalse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wacli.db")
+	raw, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	migration21Schema := strings.Replace(coreSchemaSQL, "    mentions_me INTEGER,\n", "", 1)
+	migration21Schema = strings.Replace(migration21Schema, "    replies_to_me INTEGER,\n", "", 1)
+	if _, err := raw.Exec(migration21Schema + `
+		CREATE TABLE schema_migrations (
+			version INTEGER PRIMARY KEY,
+			name TEXT NOT NULL,
+			applied_at INTEGER NOT NULL
+		);
+		INSERT INTO chats(jid, kind) VALUES('legacy@s.whatsapp.net', 'dm');
+		INSERT INTO messages(chat_jid, msg_id, ts, from_me, text)
+		VALUES('legacy@s.whatsapp.net', 'pre-provider-addressing', 1, 0, 'legacy');
+	`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("create migration-21 store: %v", err)
+	}
+	for _, migration := range schemaMigrations {
+		if migration.version > 21 {
+			continue
+		}
+		if _, err := raw.Exec(`INSERT INTO schema_migrations(version, name, applied_at) VALUES(?, ?, 1)`, migration.version, migration.name); err != nil {
+			_ = raw.Close()
+			t.Fatalf("record migration %d: %v", migration.version, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
+	}
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open migration-21 store: %v", err)
+	}
+	defer db.Close()
+	for _, column := range []string{"mentions_me", "replies_to_me"} {
+		has, err := db.tableHasColumn("messages", column)
+		if err != nil {
+			t.Fatalf("tableHasColumn(%s): %v", column, err)
+		}
+		if !has {
+			t.Fatalf("migration 22 did not add messages.%s", column)
+		}
+	}
+	if got := countRows(t, db.sql, `SELECT COUNT(*) FROM schema_migrations WHERE version = 22`); got != 1 {
+		t.Fatalf("migration 22 records = %d, want 1", got)
+	}
+	var mentionsMe sql.NullInt64
+	var repliesToMe sql.NullInt64
+	if err := db.sql.QueryRow(`
+		SELECT mentions_me, replies_to_me
+		FROM messages
+		WHERE msg_id = 'pre-provider-addressing'
+	`).Scan(&mentionsMe, &repliesToMe); err != nil {
+		t.Fatalf("read migrated provider addressing: %v", err)
+	}
+	if mentionsMe.Valid || repliesToMe.Valid {
+		t.Fatalf("migration 22 fabricated provider addressing values: mentions valid=%v replies valid=%v", mentionsMe.Valid, repliesToMe.Valid)
+	}
+}
+
 func TestTableHasColumnRejectsUnsafeIdentifier(t *testing.T) {
 	db := openTestDB(t)
 
