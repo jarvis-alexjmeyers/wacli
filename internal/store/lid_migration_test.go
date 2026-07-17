@@ -297,6 +297,106 @@ func TestMigrateLIDToPNMergesChatsAndMessages(t *testing.T) {
 	}
 }
 
+func TestMigrateLIDToPNPreservesAddressingAndChangeJoins(t *testing.T) {
+	db := openTestDB(t)
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	pn := "15551234567@s.whatsapp.net"
+	lid := "999123456789@lid"
+	for _, jid := range []string{pn, lid} {
+		if err := db.UpsertChat(jid, "dm", jid, base); err != nil {
+			t.Fatalf("UpsertChat %s: %v", jid, err)
+		}
+	}
+
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID:   pn,
+		MsgID:     "known-over-null",
+		Timestamp: base,
+		Text:      "existing",
+	}); err != nil {
+		t.Fatalf("UpsertMessage pn known-over-null: %v", err)
+	}
+	newerMention := true
+	newerReply := false
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID:     lid,
+		MsgID:       "known-over-null",
+		Timestamp:   base.Add(time.Second),
+		Text:        "incoming",
+		MentionsMe:  &newerMention,
+		RepliesToMe: &newerReply,
+	}); err != nil {
+		t.Fatalf("UpsertMessage lid known-over-null: %v", err)
+	}
+	olderMention := false
+	olderReply := true
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID:     pn,
+		MsgID:       "conflict",
+		Timestamp:   base.Add(2 * time.Second),
+		Text:        "older",
+		MentionsMe:  &olderMention,
+		RepliesToMe: &olderReply,
+	}); err != nil {
+		t.Fatalf("UpsertMessage pn conflict: %v", err)
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID:     lid,
+		MsgID:       "conflict",
+		Timestamp:   base.Add(3 * time.Second),
+		Text:        "newer",
+		MentionsMe:  &newerMention,
+		RepliesToMe: &newerReply,
+	}); err != nil {
+		t.Fatalf("UpsertMessage lid conflict: %v", err)
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID:    lid,
+		MsgID:      "lid-only",
+		Timestamp:  base.Add(4 * time.Second),
+		Text:       "lid only",
+		MentionsMe: &newerMention,
+	}); err != nil {
+		t.Fatalf("UpsertMessage lid only: %v", err)
+	}
+
+	if err := db.MigrateLIDToPN(lid, pn); err != nil {
+		t.Fatalf("MigrateLIDToPN: %v", err)
+	}
+	known, err := db.GetMessage(pn, "known-over-null")
+	if err != nil {
+		t.Fatalf("GetMessage known-over-null: %v", err)
+	}
+	if known.MentionsMe == nil || !*known.MentionsMe || known.RepliesToMe == nil || *known.RepliesToMe {
+		t.Fatalf("known-over-null addressing = MentionsMe:%s RepliesToMe:%s, want true/false", tri(known.MentionsMe), tri(known.RepliesToMe))
+	}
+	conflict, err := db.GetMessage(pn, "conflict")
+	if err != nil {
+		t.Fatalf("GetMessage conflict: %v", err)
+	}
+	if conflict.MentionsMe == nil || !*conflict.MentionsMe || conflict.RepliesToMe == nil || *conflict.RepliesToMe {
+		t.Fatalf("conflict addressing = MentionsMe:%s RepliesToMe:%s, want newer true/false", tri(conflict.MentionsMe), tri(conflict.RepliesToMe))
+	}
+
+	page, err := db.ListMessageChanges(0, 10)
+	if err != nil {
+		t.Fatalf("ListMessageChanges: %v", err)
+	}
+	found := false
+	for _, change := range page.Changes {
+		if change.MsgID != "lid-only" {
+			continue
+		}
+		found = true
+		if change.ChatJID != pn || change.Message == nil || change.Message.ChatJID != pn {
+			t.Fatalf("migrated change = %+v, want PN identity with joined message", change)
+		}
+	}
+	if !found {
+		t.Fatal("migrated lid-only change row not found")
+	}
+}
+
 func TestMigrateLIDToPNPreservesButtons(t *testing.T) {
 	db := openTestDB(t)
 	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)

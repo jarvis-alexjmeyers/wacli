@@ -174,6 +174,103 @@ func TestMessageChangesCarryProviderAddressingTriState(t *testing.T) {
 	}
 }
 
+func TestAddressingOnlyCorrectionAppendsEditChange(t *testing.T) {
+	db := openTestDB(t)
+	chat := "addressing-correction@s.whatsapp.net"
+	ts := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	if err := db.UpsertChat(chat, "dm", "Addressing correction", ts); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	p := UpsertMessageParams{
+		ChatJID:     chat,
+		MsgID:       "corrected",
+		SenderJID:   chat,
+		Timestamp:   ts,
+		Text:        "unchanged",
+		DisplayText: "unchanged",
+	}
+	if err := db.UpsertMessage(p); err != nil {
+		t.Fatalf("initial insert: %v", err)
+	}
+	initial, err := db.ListMessageChanges(0, 10)
+	if err != nil {
+		t.Fatalf("ListMessageChanges initial: %v", err)
+	}
+	if len(initial.Changes) != 1 || initial.Changes[0].Kind != "insert" || initial.Changes[0].Message == nil {
+		t.Fatalf("initial changes = %+v, want one consumer-visible insert", initial.Changes)
+	}
+	if initial.Changes[0].Message.MentionsMe != nil {
+		t.Fatalf("initial MentionsMe = %s, want null", tri(initial.Changes[0].Message.MentionsMe))
+	}
+
+	mentionsMe := true
+	p.MentionsMe = &mentionsMe
+	if err := db.UpsertMessage(p); err != nil {
+		t.Fatalf("addressing correction: %v", err)
+	}
+	corrected, err := db.ListMessageChanges(initial.Changes[0].Seq, 10)
+	if err != nil {
+		t.Fatalf("ListMessageChanges corrected: %v", err)
+	}
+	if len(corrected.Changes) != 1 || corrected.Changes[0].Kind != "edit" || corrected.Changes[0].Message == nil {
+		t.Fatalf("corrected changes = %+v, want one joined edit", corrected.Changes)
+	}
+	if corrected.Changes[0].Message.MentionsMe == nil || !*corrected.Changes[0].Message.MentionsMe {
+		t.Fatalf("corrected MentionsMe = %s, want true", tri(corrected.Changes[0].Message.MentionsMe))
+	}
+
+	if err := db.UpsertMessage(p); err != nil {
+		t.Fatalf("identical corrected redelivery: %v", err)
+	}
+	unchanged, err := db.ListMessageChanges(corrected.Changes[0].Seq, 10)
+	if err != nil {
+		t.Fatalf("ListMessageChanges unchanged: %v", err)
+	}
+	if len(unchanged.Changes) != 0 {
+		t.Fatalf("identical corrected redelivery emitted %d changes, want 0", len(unchanged.Changes))
+	}
+}
+
+func TestRevokeChangeScrubsProviderAddressing(t *testing.T) {
+	db := openTestDB(t)
+	chat := "revoke-addressing@s.whatsapp.net"
+	ts := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	if err := db.UpsertChat(chat, "dm", "Revoke addressing", ts); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	mentionsMe := true
+	repliesToMe := true
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID:     chat,
+		MsgID:       "revoke",
+		SenderJID:   chat,
+		Timestamp:   ts,
+		Text:        "mention",
+		MentionsMe:  &mentionsMe,
+		RepliesToMe: &repliesToMe,
+	}); err != nil {
+		t.Fatalf("UpsertMessage: %v", err)
+	}
+	status, err := db.MessageChangesStatus(3600)
+	if err != nil {
+		t.Fatalf("MessageChangesStatus: %v", err)
+	}
+	if err := db.MarkMessageRevoked(chat, "revoke"); err != nil {
+		t.Fatalf("MarkMessageRevoked: %v", err)
+	}
+	page, err := db.ListMessageChanges(status.MaxAllocated, 10)
+	if err != nil {
+		t.Fatalf("ListMessageChanges: %v", err)
+	}
+	if len(page.Changes) != 1 || page.Changes[0].Kind != "revoke" || page.Changes[0].Message == nil {
+		t.Fatalf("revoke changes = %+v, want one joined revoke", page.Changes)
+	}
+	message := page.Changes[0].Message
+	if message.MentionsMe != nil || message.RepliesToMe != nil {
+		t.Fatalf("revoked addressing = MentionsMe:%s RepliesToMe:%s, want both null", tri(message.MentionsMe), tri(message.RepliesToMe))
+	}
+}
+
 func TestEveryExportedMessageMutationEmitsItsChangeKind(t *testing.T) {
 	db := openTestDB(t)
 	chat := "mutations@s.whatsapp.net"

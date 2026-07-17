@@ -102,7 +102,8 @@ func (d *DB) UpsertMessage(p UpsertMessageParams) error {
 		kind = "insert"
 	case prior.ingestOrigin == "live" && origin == "history":
 		// History must never supersede a durable live delivery in the stream.
-	case prior.text != current.text || prior.displayText != current.displayText || (!prior.edited && current.edited) || prior.editedTS != current.editedTS:
+	case prior.text != current.text || prior.displayText != current.displayText || (!prior.edited && current.edited) || prior.editedTS != current.editedTS ||
+		messageAddressingChanged(prior.mentionsMe, current.mentionsMe) || messageAddressingChanged(prior.repliesToMe, current.repliesToMe):
 		kind = "edit"
 	}
 	if kind != "" {
@@ -276,6 +277,8 @@ type messageChangeState struct {
 	msgID        string
 	text         string
 	displayText  string
+	mentionsMe   sql.NullInt64
+	repliesToMe  sql.NullInt64
 	revoked      bool
 	deletedForMe bool
 	edited       bool
@@ -309,11 +312,12 @@ func readMessageChangeState(tx *sql.Tx, chatJID, msgID string) (messageChangeSta
 	var revoked, deletedForMe, edited, fromMe int
 	err := tx.QueryRowContext(storeCtx(), `
 		SELECT chat_jid, msg_id, COALESCE(text,''), COALESCE(display_text,''),
-		       revoked, deleted_for_me, edited, edited_ts, ingest_origin, ts, from_me
+		       mentions_me, replies_to_me, revoked, deleted_for_me, edited, edited_ts, ingest_origin, ts, from_me
 		FROM messages
 		WHERE chat_jid = ? AND msg_id = ?
 	`, chatJID, msgID).Scan(
 		&state.chatJID, &state.msgID, &state.text, &state.displayText,
+		&state.mentionsMe, &state.repliesToMe,
 		&revoked, &deletedForMe, &edited, &state.editedTS, &state.ingestOrigin, &state.ts, &fromMe,
 	)
 	if err != nil {
@@ -324,6 +328,13 @@ func readMessageChangeState(tx *sql.Tx, chatJID, msgID string) (messageChangeSta
 	state.edited = edited != 0
 	state.fromMe = fromMe != 0
 	return state, nil
+}
+
+func messageAddressingChanged(prior, current sql.NullInt64) bool {
+	if !prior.Valid {
+		return current.Valid
+	}
+	return current.Valid && (prior.Int64 != 0) != (current.Int64 != 0)
 }
 
 func appendMessageChange(tx *sql.Tx, kind, origin string, state messageChangeState) error {
@@ -586,37 +597,37 @@ func (d *DB) scanMessages(query string, args ...interface{}) ([]Message, error) 
 func messageFromGetRow(row storedb.GetMessageRow) Message {
 	return messageFromScalars(
 		row.Rowid, row.ChatJid, row.Name, row.MsgID, row.SenderJid, row.SenderName,
-		row.Ts, row.FromMe, row.Text, row.DisplayText, row.QuotedMsgID, row.QuotedSenderJid, row.IsForwarded,
+		row.Ts, row.FromMe, row.Text, row.DisplayText, row.QuotedMsgID, row.QuotedSenderJid, row.MentionsMe, row.RepliesToMe, row.IsForwarded,
 		row.ForwardingScore, row.ReactionToID, row.ReactionEmoji, row.MediaType,
 		row.MediaCaption, row.Filename, row.MimeType, row.DirectPath, row.LocalPath,
-		row.DownloadedAt, row.Column24, row.StarredAt, row.Revoked, row.DeletedForMe,
-		row.Buttons, row.Column29,
+		row.DownloadedAt, row.Column26, row.StarredAt, row.Revoked, row.DeletedForMe,
+		row.Buttons, row.Column31,
 	)
 }
 
 func messageFromBeforeRow(row storedb.MessageContextBeforeRow) Message {
 	return messageFromScalars(
 		row.Rowid, row.ChatJid, row.Name, row.MsgID, row.SenderJid, row.SenderName,
-		row.Ts, row.FromMe, row.Text, row.DisplayText, row.QuotedMsgID, row.QuotedSenderJid, row.IsForwarded,
+		row.Ts, row.FromMe, row.Text, row.DisplayText, row.QuotedMsgID, row.QuotedSenderJid, row.MentionsMe, row.RepliesToMe, row.IsForwarded,
 		row.ForwardingScore, row.ReactionToID, row.ReactionEmoji, row.MediaType,
 		row.MediaCaption, row.Filename, row.MimeType, row.DirectPath, row.LocalPath,
-		row.DownloadedAt, row.Column24, row.StarredAt, row.Revoked, row.DeletedForMe,
-		row.Buttons, row.Column29,
+		row.DownloadedAt, row.Column26, row.StarredAt, row.Revoked, row.DeletedForMe,
+		row.Buttons, row.Column31,
 	)
 }
 
 func messageFromAfterRow(row storedb.MessageContextAfterRow) Message {
 	return messageFromScalars(
 		row.Rowid, row.ChatJid, row.Name, row.MsgID, row.SenderJid, row.SenderName,
-		row.Ts, row.FromMe, row.Text, row.DisplayText, row.QuotedMsgID, row.QuotedSenderJid, row.IsForwarded,
+		row.Ts, row.FromMe, row.Text, row.DisplayText, row.QuotedMsgID, row.QuotedSenderJid, row.MentionsMe, row.RepliesToMe, row.IsForwarded,
 		row.ForwardingScore, row.ReactionToID, row.ReactionEmoji, row.MediaType,
 		row.MediaCaption, row.Filename, row.MimeType, row.DirectPath, row.LocalPath,
-		row.DownloadedAt, row.Column24, row.StarredAt, row.Revoked, row.DeletedForMe,
-		row.Buttons, row.Column29,
+		row.DownloadedAt, row.Column26, row.StarredAt, row.Revoked, row.DeletedForMe,
+		row.Buttons, row.Column31,
 	)
 }
 
-func messageFromScalars(rowID int64, chatJID, chatName, msgID, senderJID, senderName string, ts, fromMe int64, text, displayText, quotedMsgID, quotedSenderJID string, forwarded, forwardingScore int64, reactionToID, reactionEmoji, mediaType, mediaCaption, filename, mimeType, directPath, localPath string, downloadedAt, starred, starredAt, revoked, deletedForMe int64, buttonsJSON, snippet string) Message {
+func messageFromScalars(rowID int64, chatJID, chatName, msgID, senderJID, senderName string, ts, fromMe int64, text, displayText, quotedMsgID, quotedSenderJID string, mentionsMe, repliesToMe sql.NullInt64, forwarded, forwardingScore int64, reactionToID, reactionEmoji, mediaType, mediaCaption, filename, mimeType, directPath, localPath string, downloadedAt, starred, starredAt, revoked, deletedForMe int64, buttonsJSON, snippet string) Message {
 	m := Message{
 		rowID:           rowID,
 		ChatJID:         chatJID,
@@ -630,6 +641,8 @@ func messageFromScalars(rowID int64, chatJID, chatName, msgID, senderJID, sender
 		DisplayText:     displayText,
 		QuotedMsgID:     quotedMsgID,
 		QuotedSenderJID: quotedSenderJID,
+		MentionsMe:      nullInt64ToBoolPtr(mentionsMe),
+		RepliesToMe:     nullInt64ToBoolPtr(repliesToMe),
 		IsForwarded:     forwarded != 0,
 		ForwardingScore: uint32(forwardingScore),
 		ReactionToID:    reactionToID,

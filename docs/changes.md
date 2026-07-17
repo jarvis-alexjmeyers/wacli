@@ -22,6 +22,8 @@ wacli changes status --json [--lookback-s N]
 
 Both commands honor `--read-only` and `WACLI_READONLY=1`.
 
+The sync daemon performs store migrations during a writable open. After upgrading wacli, run the sync daemon once before polling `changes`; a read-only poll never auto-migrates an older store and returns `store_not_migrated` until that writable open completes.
+
 ## Examples
 
 ```bash

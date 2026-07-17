@@ -9,6 +9,7 @@ import (
 var (
 	ErrChangeCursorGap    = errors.New("cursor_gap")
 	ErrChangeCursorFuture = errors.New("cursor_future")
+	ErrStoreNotMigrated   = errors.New("store_not_migrated")
 )
 
 type MessageChange struct {
@@ -65,6 +66,43 @@ func readMessageChangeBounds(tx *sql.Tx) (messageChangeBounds, error) {
 	return bounds, err
 }
 
+func requireMessageChangesSchema(tx *sql.Tx) error {
+	var tables int
+	if err := tx.QueryRowContext(storeCtx(), `
+		SELECT COUNT(*)
+		FROM sqlite_master
+		WHERE type = 'table' AND name IN ('store_meta', 'message_changes')
+	`).Scan(&tables); err != nil {
+		return err
+	}
+	if tables != 2 {
+		return ErrStoreNotMigrated
+	}
+
+	var messageColumns, changeColumns, metadata int
+	if err := tx.QueryRowContext(storeCtx(), `
+		SELECT
+			(SELECT COUNT(*) FROM pragma_table_info('messages')
+			 WHERE name IN ('mentions_me', 'replies_to_me')),
+			(SELECT COUNT(*) FROM pragma_table_info('message_changes')
+			 WHERE name IN ('seq', 'chat_jid', 'msg_id', 'kind', 'origin', 'ts', 'from_me', 'created_at')),
+			(SELECT COUNT(*) FROM store_meta
+			 WHERE key IN ('store_instance_id', 'changes_last_pruned_seq'))
+	`).Scan(&messageColumns, &changeColumns, &metadata); err != nil {
+		return err
+	}
+	if messageColumns != 2 {
+		return ErrStoreNotMigrated
+	}
+	if changeColumns != 8 {
+		return ErrStoreNotMigrated
+	}
+	if metadata != 2 {
+		return ErrStoreNotMigrated
+	}
+	return nil
+}
+
 func (d *DB) ListMessageChanges(afterSeq int64, limit int) (MessageChangesPage, error) {
 	if limit <= 0 {
 		limit = 200
@@ -77,6 +115,9 @@ func (d *DB) ListMessageChanges(afterSeq int64, limit int) (MessageChangesPage, 
 		return MessageChangesPage{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := requireMessageChangesSchema(tx); err != nil {
+		return MessageChangesPage{}, err
+	}
 
 	bounds, err := readMessageChangeBounds(tx)
 	if err != nil {
@@ -179,12 +220,10 @@ func scanMessageChange(rows *sql.Rows) (MessageChange, bool, Message, error) {
 	m = messageFromScalars(
 		m.rowID, m.ChatJID, m.ChatName, m.MsgID, m.SenderJID, m.SenderName,
 		ts, int64(fromMe), m.Text, m.DisplayText, m.QuotedMsgID, m.QuotedSenderJID,
-		int64(forwarded), forwardingScore, m.ReactionToID, m.ReactionEmoji, m.MediaType,
+		mentionsMe, repliesToMe, int64(forwarded), forwardingScore, m.ReactionToID, m.ReactionEmoji, m.MediaType,
 		m.MediaCaption, m.Filename, m.MimeType, m.DirectPath, m.LocalPath,
 		downloadedAt, int64(starred), starredAt, int64(revoked), int64(deletedForMe), buttonsJSON, snippet,
 	)
-	m.MentionsMe = nullInt64ToBoolPtr(mentionsMe)
-	m.RepliesToMe = nullInt64ToBoolPtr(repliesToMe)
 	return change, present != 0, m, nil
 }
 
@@ -197,6 +236,9 @@ func (d *DB) MessageChangesStatus(lookbackSeconds int64) (MessageChangesStatus, 
 		return MessageChangesStatus{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := requireMessageChangesSchema(tx); err != nil {
+		return MessageChangesStatus{}, err
+	}
 	bounds, err := readMessageChangeBounds(tx)
 	if err != nil {
 		return MessageChangesStatus{}, err
