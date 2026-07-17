@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -39,6 +40,7 @@ type UpsertMessageParams struct {
 	Edited          bool
 	Revoked         bool
 	DeletedForMe    bool
+	Origin          string
 }
 
 func messageSelectColumns(snippet string) string {
@@ -53,6 +55,62 @@ func snippetSQL(snippet string) string {
 }
 
 func (d *DB) UpsertMessage(p UpsertMessageParams) error {
+	origin, err := normalizeMessageOrigin(p.Origin)
+	if err != nil {
+		return err
+	}
+	params := prepareUpsertMessage(p, origin)
+
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := acquireMessageWriter(tx); err != nil {
+		return err
+	}
+
+	prior, err := readMessageChangeState(tx, p.ChatJID, p.MsgID)
+	priorExists := err == nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err := d.q.WithTx(tx).UpsertMessage(storeCtx(), params); err != nil {
+		return err
+	}
+	current, err := readMessageChangeState(tx, p.ChatJID, p.MsgID)
+	if err != nil {
+		return err
+	}
+
+	kind := ""
+	switch {
+	case !priorExists:
+		kind = "insert"
+	// Revoke/delete transitions outrank the history->live upgrade: a live
+	// revoke over a history-origin row still flips ingest_origin, but its
+	// change kind must stay 'revoke' — emitting it as insert(origin='live')
+	// would push a blank tombstone into the consumer's forwardable lane.
+	case !prior.revoked && current.revoked:
+		kind = "revoke"
+	case !prior.deletedForMe && current.deletedForMe:
+		kind = "delete"
+	case prior.ingestOrigin == "history" && origin == "live" && current.ingestOrigin == "live":
+		kind = "insert"
+	case prior.ingestOrigin == "live" && origin == "history":
+		// History must never supersede a durable live delivery in the stream.
+	case prior.text != current.text || prior.displayText != current.displayText || (!prior.edited && current.edited) || prior.editedTS != current.editedTS:
+		kind = "edit"
+	}
+	if kind != "" {
+		if err := appendMessageChange(tx, kind, origin, current); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func prepareUpsertMessage(p UpsertMessageParams, origin string) storedb.UpsertMessageParams {
 	if p.Revoked || p.DeletedForMe {
 		p.Text = ""
 		p.Buttons = nil
@@ -83,7 +141,7 @@ func (d *DB) UpsertMessage(p UpsertMessageParams) error {
 	if p.Edited {
 		editedTS = unix(p.Timestamp)
 	}
-	return d.q.UpsertMessage(storeCtx(), storedb.UpsertMessageParams{
+	return storedb.UpsertMessageParams{
 		ChatJid:         p.ChatJID,
 		ChatName:        nullString(p.ChatName),
 		MsgID:           p.MsgID,
@@ -113,22 +171,20 @@ func (d *DB) UpsertMessage(p UpsertMessageParams) error {
 		Edited:          boolToInt64(p.Edited),
 		EditedTs:        editedTS,
 		Buttons:         buttonsJSON,
-	})
+		IngestOrigin:    origin,
+	}
 }
 
 func (d *DB) MarkMessageRevoked(chatJID, msgID string) error {
-	n, err := d.q.MarkMessageRevoked(storeCtx(), storedb.MarkMessageRevokedParams{
-		DisplayText: sql.NullString{String: DeletedMessageDisplayText, Valid: true},
-		ChatJid:     strings.TrimSpace(chatJID),
-		MsgID:       strings.TrimSpace(msgID),
+	chatJID = strings.TrimSpace(chatJID)
+	msgID = strings.TrimSpace(msgID)
+	return d.mutateExistingMessage(chatJID, msgID, "revoke", func(q *storedb.Queries) (int64, error) {
+		return q.MarkMessageRevoked(storeCtx(), storedb.MarkMessageRevokedParams{
+			DisplayText: sql.NullString{String: DeletedMessageDisplayText, Valid: true},
+			ChatJid:     chatJID,
+			MsgID:       msgID,
+		})
 	})
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
 }
 
 func (d *DB) MarkMessageDeletedForMe(chatJID, msgID, senderJID string, fromMe bool, deletedAt time.Time) error {
@@ -143,25 +199,40 @@ func (d *DB) MarkMessageDeletedForMe(chatJID, msgID, senderJID string, fromMe bo
 	if deletedAt.IsZero() {
 		deletedAt = nowUTC()
 	}
-	n, err := d.q.MarkMessageDeletedForMe(storeCtx(), storedb.MarkMessageDeletedForMeParams{
-		DisplayText: sql.NullString{String: DeletedForMeMessageDisplayText, Valid: true},
-		ChatJid:     chatJID,
-		MsgID:       msgID,
+	err := d.mutateExistingMessage(chatJID, msgID, "delete", func(q *storedb.Queries) (int64, error) {
+		return q.MarkMessageDeletedForMe(storeCtx(), storedb.MarkMessageDeletedForMeParams{
+			DisplayText: sql.NullString{String: DeletedForMeMessageDisplayText, Valid: true},
+			ChatJid:     chatJID,
+			MsgID:       msgID,
+		})
 	})
-	if err != nil {
-		return err
-	}
-	if n > 0 {
+	if err == nil {
 		return nil
 	}
-	return d.UpsertMessage(UpsertMessageParams{
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	// Deliberately NON-emitting: a delete-for-me for a message the store never
+	// held inserts a contentless tombstone row only. There is nothing a change
+	// consumer could act on — no content existed at any seq — and an
+	// insert-kind change here would push a blank row into the forwardable lane.
+	params := prepareUpsertMessage(UpsertMessageParams{
 		ChatJID:      chatJID,
 		MsgID:        msgID,
 		SenderJID:    senderJID,
 		Timestamp:    deletedAt,
 		FromMe:       fromMe,
 		DeletedForMe: true,
-	})
+	}, "live")
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := d.q.WithTx(tx).UpsertMessage(storeCtx(), params); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (d *DB) MarkMessageDeletedForMePreserveMedia(chatJID, msgID string) error {
@@ -173,34 +244,112 @@ func (d *DB) MarkMessageDeletedForMePreserveMedia(chatJID, msgID string) error {
 	if msgID == "" {
 		return fmt.Errorf("message ID is required")
 	}
-	n, err := d.q.MarkMessageDeletedForMePreserveMedia(storeCtx(), storedb.MarkMessageDeletedForMePreserveMediaParams{
-		DisplayText: sql.NullString{String: DeletedForMeMessageDisplayText, Valid: true},
-		ChatJid:     chatJID,
-		MsgID:       msgID,
+	return d.mutateExistingMessage(chatJID, msgID, "delete", func(q *storedb.Queries) (int64, error) {
+		return q.MarkMessageDeletedForMePreserveMedia(storeCtx(), storedb.MarkMessageDeletedForMePreserveMediaParams{
+			DisplayText: sql.NullString{String: DeletedForMeMessageDisplayText, Valid: true},
+			ChatJid:     chatJID,
+			MsgID:       msgID,
+		})
 	})
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
 }
 
 func (d *DB) UpdateMessageText(chatJID, msgID, text string) error {
-	n, err := d.q.UpdateMessageText(storeCtx(), storedb.UpdateMessageTextParams{
-		Text:        nullString(text),
-		DisplayText: nullString(text),
-		ChatJid:     strings.TrimSpace(chatJID),
-		MsgID:       strings.TrimSpace(msgID),
+	chatJID = strings.TrimSpace(chatJID)
+	msgID = strings.TrimSpace(msgID)
+	return d.mutateExistingMessage(chatJID, msgID, "edit", func(q *storedb.Queries) (int64, error) {
+		return q.UpdateMessageText(storeCtx(), storedb.UpdateMessageTextParams{
+			Text:        nullString(text),
+			DisplayText: nullString(text),
+			ChatJid:     chatJID,
+			MsgID:       msgID,
+		})
 	})
+}
+
+type messageChangeState struct {
+	chatJID      string
+	msgID        string
+	text         string
+	displayText  string
+	revoked      bool
+	deletedForMe bool
+	edited       bool
+	editedTS     int64
+	ingestOrigin string
+	ts           int64
+	fromMe       bool
+}
+
+func acquireMessageWriter(tx *sql.Tx) error {
+	// UpsertMessage must read prior state before writing. A no-op write first
+	// acquires SQLite's single writer slot, so the read snapshot cannot lose a
+	// later write-upgrade race to concurrent media metadata updates.
+	_, err := tx.ExecContext(storeCtx(), `UPDATE store_meta SET value = value WHERE 0`)
+	return err
+}
+
+func normalizeMessageOrigin(origin string) (string, error) {
+	origin = strings.TrimSpace(origin)
+	if origin == "" {
+		return "live", nil
+	}
+	if origin != "live" && origin != "history" {
+		return "", fmt.Errorf("message origin must be live or history")
+	}
+	return origin, nil
+}
+
+func readMessageChangeState(tx *sql.Tx, chatJID, msgID string) (messageChangeState, error) {
+	var state messageChangeState
+	var revoked, deletedForMe, edited, fromMe int
+	err := tx.QueryRowContext(storeCtx(), `
+		SELECT chat_jid, msg_id, COALESCE(text,''), COALESCE(display_text,''),
+		       revoked, deleted_for_me, edited, edited_ts, ingest_origin, ts, from_me
+		FROM messages
+		WHERE chat_jid = ? AND msg_id = ?
+	`, chatJID, msgID).Scan(
+		&state.chatJID, &state.msgID, &state.text, &state.displayText,
+		&revoked, &deletedForMe, &edited, &state.editedTS, &state.ingestOrigin, &state.ts, &fromMe,
+	)
+	if err != nil {
+		return messageChangeState{}, err
+	}
+	state.revoked = revoked != 0
+	state.deletedForMe = deletedForMe != 0
+	state.edited = edited != 0
+	state.fromMe = fromMe != 0
+	return state, nil
+}
+
+func appendMessageChange(tx *sql.Tx, kind, origin string, state messageChangeState) error {
+	_, err := tx.ExecContext(storeCtx(), `
+		INSERT INTO message_changes(chat_jid, msg_id, kind, origin, ts, from_me, created_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?)
+	`, state.chatJID, state.msgID, kind, origin, state.ts, boolToInt(state.fromMe), nowUTC().Unix())
+	return err
+}
+
+func (d *DB) mutateExistingMessage(chatJID, msgID, kind string, mutate func(*storedb.Queries) (int64, error)) error {
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	n, err := mutate(d.q.WithTx(tx))
 	if err != nil {
 		return err
 	}
 	if n == 0 {
 		return sql.ErrNoRows
 	}
-	return nil
+	state, err := readMessageChangeState(tx, chatJID, msgID)
+	if err != nil {
+		return err
+	}
+	if err := appendMessageChange(tx, kind, "live", state); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 type ListMessagesParams struct {

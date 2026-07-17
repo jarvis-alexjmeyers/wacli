@@ -89,12 +89,31 @@ CREATE TABLE IF NOT EXISTS messages (
     edited INTEGER NOT NULL DEFAULT 0,
     edited_ts INTEGER NOT NULL DEFAULT 0,
     buttons TEXT,
+    ingest_origin TEXT NOT NULL DEFAULT 'live',
     UNIQUE(chat_jid, msg_id),
     FOREIGN KEY (chat_jid) REFERENCES chats(jid) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, ts);
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
+
+CREATE TABLE IF NOT EXISTS store_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS message_changes (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_jid TEXT NOT NULL,
+    msg_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    from_me INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_changes_created_at ON message_changes(created_at);
 
 CREATE TABLE IF NOT EXISTS status_messages (
     rowid INTEGER PRIMARY KEY AUTOINCREMENT,

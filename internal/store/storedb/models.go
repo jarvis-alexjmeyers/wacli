@@ -115,6 +115,18 @@ type Message struct {
 	Edited             int64
 	EditedTs           int64
 	Buttons            sql.NullString
+	IngestOrigin       string
+}
+
+type MessageChange struct {
+	Seq       int64
+	ChatJid   string
+	MsgID     string
+	Kind      string
+	Origin    string
+	Ts        int64
+	FromMe    int64
+	CreatedAt int64
 }
 
 type MessagesFt struct {
@@ -173,4 +185,9 @@ type StatusMessage struct {
 	FileLength      sql.NullInt64
 	BackgroundColor sql.NullString
 	Font            sql.NullInt64
+}
+
+type StoreMetum struct {
+	Key   string
+	Value string
 }

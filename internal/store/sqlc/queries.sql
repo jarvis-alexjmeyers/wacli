@@ -173,7 +173,8 @@ INSERT INTO messages(
     quoted_msg_id, quoted_sender_jid,
     is_forwarded, forwarding_score, reaction_to_id, reaction_emoji,
     media_type, media_caption, filename, mime_type, direct_path,
-    media_key, file_sha256, file_enc_sha256, file_length, revoked, deleted_for_me, edited, edited_ts, buttons
+    media_key, file_sha256, file_enc_sha256, file_length, revoked, deleted_for_me, edited, edited_ts, buttons,
+    ingest_origin
 ) VALUES (
     ?, ?, ?, ?, ?,
     ?, ?, ?, ?,
@@ -181,7 +182,8 @@ INSERT INTO messages(
     ?, ?, ?, ?,
     ?, ?, ?, ?, ?,
     ?, ?, ?, ?,
-    ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?,
+    ?
 )
 ON CONFLICT(chat_jid, msg_id) DO UPDATE SET
     chat_name=COALESCE(NULLIF(excluded.chat_name,''), messages.chat_name),
@@ -213,7 +215,8 @@ ON CONFLICT(chat_jid, msg_id) DO UPDATE SET
     deleted_for_me=CASE WHEN excluded.deleted_for_me != 0 THEN 1 ELSE messages.deleted_for_me END,
     edited=CASE WHEN excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN 0 WHEN excluded.edited != 0 THEN 1 WHEN messages.edited != 0 THEN messages.edited ELSE 0 END,
     edited_ts=CASE WHEN excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN 0 WHEN excluded.edited != 0 AND (messages.edited = 0 OR excluded.edited_ts > messages.edited_ts) THEN excluded.edited_ts WHEN messages.edited != 0 THEN messages.edited_ts ELSE 0 END,
-    buttons=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.buttons ELSE excluded.buttons END;
+    buttons=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.buttons ELSE excluded.buttons END,
+    ingest_origin=CASE WHEN messages.ingest_origin = 'history' AND excluded.ingest_origin = 'live' THEN 'live' ELSE messages.ingest_origin END;
 
 -- name: MarkMessageRevoked :execrows
 UPDATE messages
