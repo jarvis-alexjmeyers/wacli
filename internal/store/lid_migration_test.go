@@ -597,3 +597,38 @@ func TestHistoricalLIDJIDsFindsStrandedChangeRows(t *testing.T) {
 		t.Fatalf("change row did not rejoin its message after migration: %+v", page.Changes)
 	}
 }
+
+func TestMigrateLIDToPNPreservesIngestOrigin(t *testing.T) {
+	// A history-origin row stored under a LID must stay history after
+	// canonicalization — the schema default would silently flip it to 'live',
+	// making a later identical live delivery emit nothing while the original
+	// history change stays non-forwardable (permanently missed message).
+	db := openTestDB(t)
+	lid := "77777@lid"
+	pn := "12025550177@s.whatsapp.net"
+	ts := time.Date(2026, 7, 17, 18, 30, 0, 0, time.UTC)
+	if err := db.UpsertChat(lid, "dm", "LID", ts); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{ChatJID: lid, MsgID: "h1", SenderJID: lid, Timestamp: ts, Text: "from history", Origin: "history"}); err != nil {
+		t.Fatalf("history insert under LID: %v", err)
+	}
+	if err := db.MigrateLIDToPN(lid, pn); err != nil {
+		t.Fatalf("MigrateLIDToPN: %v", err)
+	}
+	if got := messageIngestOrigin(t, db, pn, "h1"); got != "history" {
+		t.Fatalf("ingest_origin after LID migration = %q, want history", got)
+	}
+	// The real live delivery still upgrades and emits a forwardable insert.
+	if err := db.UpsertMessage(UpsertMessageParams{ChatJID: pn, MsgID: "h1", SenderJID: pn, Timestamp: ts, Text: "from history"}); err != nil {
+		t.Fatalf("live redelivery after migration: %v", err)
+	}
+	page, err := db.ListMessageChanges(0, 20)
+	if err != nil {
+		t.Fatalf("ListMessageChanges: %v", err)
+	}
+	last := page.Changes[len(page.Changes)-1]
+	if last.Kind != "insert" || last.Origin != "live" {
+		t.Fatalf("post-migration live redelivery emitted %s:%s, want insert:live", last.Kind, last.Origin)
+	}
+}
