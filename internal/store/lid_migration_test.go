@@ -555,3 +555,45 @@ func TestMigrateLIDToPNPreservesEditedState(t *testing.T) {
 		t.Fatalf("original upsert clobbered migrated edit: %q", msg.Text)
 	}
 }
+
+func TestHistoricalLIDJIDsFindsStrandedChangeRows(t *testing.T) {
+	// A pre-fix store can have messages already at PN while change rows stay
+	// under LID: discovery must still surface the LID so the migration's
+	// change-row rewrite runs (exact-head gate P1).
+	db := openTestDB(t)
+	lid := "12345@lid"
+	pn := "12025550100@s.whatsapp.net"
+	ts := time.Date(2026, 7, 17, 15, 30, 0, 0, time.UTC)
+	if err := db.UpsertChat(pn, "dm", "PN", ts); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{ChatJID: pn, MsgID: "m1", SenderJID: pn, Timestamp: ts, Text: "hello"}); err != nil {
+		t.Fatalf("UpsertMessage: %v", err)
+	}
+	if _, err := db.sql.Exec(`UPDATE message_changes SET chat_jid = ? WHERE chat_jid = ?`, lid, pn); err != nil {
+		t.Fatalf("strand change rows under LID: %v", err)
+	}
+	jids, err := db.HistoricalLIDJIDs()
+	if err != nil {
+		t.Fatalf("HistoricalLIDJIDs: %v", err)
+	}
+	found := false
+	for _, j := range jids {
+		if j == lid {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("stranded change-row LID not discovered: %v", jids)
+	}
+	if err := db.MigrateLIDToPN(lid, pn); err != nil {
+		t.Fatalf("MigrateLIDToPN: %v", err)
+	}
+	page, err := db.ListMessageChanges(0, 10)
+	if err != nil {
+		t.Fatalf("ListMessageChanges: %v", err)
+	}
+	if len(page.Changes) != 1 || page.Changes[0].Message == nil {
+		t.Fatalf("change row did not rejoin its message after migration: %+v", page.Changes)
+	}
+}

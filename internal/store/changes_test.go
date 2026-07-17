@@ -770,3 +770,46 @@ func TestDeletedForMeTombstoneFallbackEmitsNoChange(t *testing.T) {
 		t.Fatalf("tombstone fallback emitted %d change(s), want 0", len(page.Changes))
 	}
 }
+
+func TestHistoryReplayResolvingAddressingEmitsEdit(t *testing.T) {
+	db := openTestDB(t)
+	chat := "history-resolve@s.whatsapp.net"
+	ts := time.Date(2026, 7, 17, 15, 0, 0, 0, time.UTC)
+	if err := db.UpsertChat(chat, "dm", "HistoryResolve", ts); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	// Live delivery with the verdict unresolved (quoted message not yet local).
+	live := UpsertMessageParams{ChatJID: chat, MsgID: "m1", SenderJID: chat, Timestamp: ts, Text: "reply"}
+	if err := db.UpsertMessage(live); err != nil {
+		t.Fatalf("live insert: %v", err)
+	}
+	// History replay resolves RepliesToMe. The live→history no-emit rule must
+	// NOT suppress this: the persisted verdict changed, so an edit must exist
+	// for edit-aware consumers (exact-head gate P1).
+	resolved := true
+	replay := UpsertMessageParams{ChatJID: chat, MsgID: "m1", SenderJID: chat, Timestamp: ts, Text: "reply", Origin: "history", RepliesToMe: &resolved}
+	if err := db.UpsertMessage(replay); err != nil {
+		t.Fatalf("history replay: %v", err)
+	}
+	page, err := db.ListMessageChanges(0, 10)
+	if err != nil {
+		t.Fatalf("ListMessageChanges: %v", err)
+	}
+	if len(page.Changes) != 2 || page.Changes[1].Kind != "edit" {
+		t.Fatalf("changes after resolving replay = %+v, want insert then edit", page.Changes)
+	}
+	if got := messageIngestOrigin(t, db, chat, "m1"); got != "live" {
+		t.Fatalf("ingest origin downgraded to %q", got)
+	}
+	// Identical history redelivery (no value change) still emits nothing.
+	if err := db.UpsertMessage(replay); err != nil {
+		t.Fatalf("identical history redelivery: %v", err)
+	}
+	page, err = db.ListMessageChanges(0, 10)
+	if err != nil {
+		t.Fatalf("ListMessageChanges: %v", err)
+	}
+	if len(page.Changes) != 2 {
+		t.Fatalf("identical history redelivery emitted; changes = %d", len(page.Changes))
+	}
+}

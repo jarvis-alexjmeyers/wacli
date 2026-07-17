@@ -250,6 +250,9 @@ func (d *DB) ensureCurrentSchema() error {
 	if err := migrateMessageChanges(d); err != nil {
 		return fmt.Errorf("ensure current message changes schema: %w", err)
 	}
+	if err := migrateMessagesProviderAddressingColumns(d); err != nil {
+		return fmt.Errorf("ensure current provider addressing columns: %w", err)
+	}
 	return nil
 }
 

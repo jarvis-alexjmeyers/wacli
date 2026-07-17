@@ -100,8 +100,15 @@ func (d *DB) UpsertMessage(p UpsertMessageParams) error {
 		kind = "delete"
 	case prior.ingestOrigin == "history" && origin == "live" && current.ingestOrigin == "live":
 		kind = "insert"
-	case prior.ingestOrigin == "live" && origin == "history":
-		// History must never supersede a durable live delivery in the stream.
+	case prior.ingestOrigin == "live" && origin == "history" &&
+		!messageAddressingChanged(prior.mentionsMe, current.mentionsMe) &&
+		!messageAddressingChanged(prior.repliesToMe, current.repliesToMe):
+		// History must never supersede a durable live delivery in the stream —
+		// but a history replay that RESOLVES an addressing verdict (the quoted
+		// message arrived via backfill, so RepliesToMe NULL→true persists via
+		// the upsert) must still record an edit: suppressing it here would
+		// erase the only event an edit-aware consumer could ever observe
+		// (exact-head gate P1).
 	case prior.text != current.text || prior.displayText != current.displayText || (!prior.edited && current.edited) || prior.editedTS != current.editedTS ||
 		messageAddressingChanged(prior.mentionsMe, current.mentionsMe) || messageAddressingChanged(prior.repliesToMe, current.repliesToMe):
 		kind = "edit"

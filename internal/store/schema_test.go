@@ -813,3 +813,48 @@ func dropSchemaStatement(t *testing.T, schema, marker string) string {
 	}
 	return schema[:start] + schema[start+end+1:]
 }
+
+// TestEnsureCurrentSchemaRepairsMissingAddressingColumn pins the recovery
+// path for a partial/pre-release store: migration 22 recorded but an
+// addressing column missing must self-repair on the next writable open —
+// otherwise the documented "run sync once" recovery loops on
+// store_not_migrated forever (exact-head gate P1).
+func TestEnsureCurrentSchemaRepairsMissingAddressingColumn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wacli.db")
+	raw, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	partial := strings.Replace(coreSchemaSQL, "    replies_to_me INTEGER,\n", "", 1)
+	if _, err := raw.Exec(partial + `
+		CREATE TABLE schema_migrations (
+			version INTEGER PRIMARY KEY,
+			name TEXT NOT NULL,
+			applied_at INTEGER NOT NULL
+		);
+	`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("create partial store: %v", err)
+	}
+	for _, migration := range schemaMigrations {
+		if _, err := raw.Exec(`INSERT INTO schema_migrations(version, name, applied_at) VALUES(?, ?, 1)`, migration.version, migration.name); err != nil {
+			_ = raw.Close()
+			t.Fatalf("record migration %d: %v", migration.version, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
+	}
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open partial store: %v", err)
+	}
+	defer db.Close()
+	has, err := db.tableHasColumn("messages", "replies_to_me")
+	if err != nil {
+		t.Fatalf("tableHasColumn: %v", err)
+	}
+	if !has {
+		t.Fatal("writable open did not repair the missing addressing column")
+	}
+}

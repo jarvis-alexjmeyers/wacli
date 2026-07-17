@@ -26,6 +26,8 @@ func (d *DB) HistoricalLIDJIDs() ([]string, error) {
 		SELECT chat_jid FROM poll_votes WHERE chat_jid GLOB '*@lid'
 		UNION
 		SELECT voter_jid FROM poll_votes WHERE voter_jid GLOB '*@lid'
+		UNION
+		SELECT chat_jid FROM message_changes WHERE chat_jid GLOB '*@lid'
 		ORDER BY 1
 	`)
 	if err != nil {
