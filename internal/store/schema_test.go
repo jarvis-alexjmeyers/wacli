@@ -699,3 +699,117 @@ func indexExists(t *testing.T, db *sql.DB, name string) bool {
 	}
 	return found == name
 }
+
+// TestOld927StoreUpgradeGainsMessageChangesMachinery pins the highest-risk
+// merge seam: the DEPLOYED 0.11.2-wave.927 staging store recorded version 21
+// with the OLD branch's semantics ("messages provider addressing columns"), so
+// this merged binary's version loop SKIPS 21 ("message changes") on such a
+// store. Correctness rides entirely on ensureCurrentSchema unconditionally
+// re-running the idempotent migrateMessageChanges; if that safety net is ever
+// removed, a 927-deployed store silently ships without the change stream —
+// this test is what fails first.
+func TestOld927StoreUpgradeGainsMessageChangesMachinery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wacli.db")
+	raw, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	// Old-927 shape: mentions columns PRESENT; message-changes machinery
+	// (messages.ingest_origin, store_meta, message_changes) ABSENT.
+	old927Schema := strings.Replace(
+		coreSchemaSQL, "    ingest_origin TEXT NOT NULL DEFAULT 'live',\n", "", 1,
+	)
+	old927Schema = dropSchemaStatement(t, old927Schema, "CREATE TABLE IF NOT EXISTS store_meta")
+	old927Schema = dropSchemaStatement(t, old927Schema, "CREATE TABLE IF NOT EXISTS message_changes")
+	old927Schema = dropSchemaStatement(t, old927Schema, "CREATE INDEX IF NOT EXISTS idx_message_changes_created_at")
+	if _, err := raw.Exec(old927Schema + `
+		CREATE TABLE schema_migrations (
+			version INTEGER PRIMARY KEY,
+			name TEXT NOT NULL,
+			applied_at INTEGER NOT NULL
+		);
+		INSERT INTO chats(jid, kind) VALUES('legacy@s.whatsapp.net', 'dm');
+		INSERT INTO messages(chat_jid, msg_id, ts, from_me, text, mentions_me)
+		VALUES('legacy@s.whatsapp.net', 'pre-938', 1, 0, 'legacy', NULL);
+	`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("create old-927 store: %v", err)
+	}
+	// The old branch recorded 1..21 where 21 was "messages provider addressing
+	// columns" — reproduce that record verbatim.
+	for _, migration := range schemaMigrations {
+		if migration.version > 20 {
+			continue
+		}
+		if _, err := raw.Exec(`INSERT INTO schema_migrations(version, name, applied_at) VALUES(?, ?, 1)`, migration.version, migration.name); err != nil {
+			_ = raw.Close()
+			t.Fatalf("record migration %d: %v", migration.version, err)
+		}
+	}
+	if _, err := raw.Exec(`INSERT INTO schema_migrations(version, name, applied_at) VALUES(21, 'messages provider addressing columns', 1)`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("record old-927 migration 21: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
+	}
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open old-927 store: %v", err)
+	}
+	defer db.Close()
+	for _, table := range []string{"store_meta", "message_changes"} {
+		has, err := db.tableExists(table)
+		if err != nil {
+			t.Fatalf("tableExists(%s): %v", table, err)
+		}
+		if !has {
+			t.Fatalf("old-927 upgrade left %s missing — the change stream is dead on staging-shaped stores", table)
+		}
+	}
+	hasOrigin, err := db.tableHasColumn("messages", "ingest_origin")
+	if err != nil {
+		t.Fatalf("tableHasColumn(ingest_origin): %v", err)
+	}
+	if !hasOrigin {
+		t.Fatal("old-927 upgrade did not add messages.ingest_origin")
+	}
+	var origin string
+	if err := db.sql.QueryRow(`SELECT ingest_origin FROM messages WHERE msg_id = 'pre-938'`).Scan(&origin); err != nil {
+		t.Fatalf("read legacy ingest_origin: %v", err)
+	}
+	if origin != "live" {
+		t.Fatalf("legacy row ingest_origin = %q, want live", origin)
+	}
+	var mentions sql.NullInt64
+	if err := db.sql.QueryRow(`SELECT mentions_me FROM messages WHERE msg_id = 'pre-938'`).Scan(&mentions); err != nil {
+		t.Fatalf("read legacy mentions_me: %v", err)
+	}
+	if mentions.Valid {
+		t.Fatalf("legacy mentions_me became %d, want NULL (never fabricate a verdict)", mentions.Int64)
+	}
+	var instance string
+	if err := db.sql.QueryRow(`SELECT value FROM store_meta WHERE key = 'store_instance_id'`).Scan(&instance); err != nil {
+		t.Fatalf("store_instance_id missing after old-927 upgrade: %v", err)
+	}
+	if instance == "" {
+		t.Fatal("store_instance_id empty after old-927 upgrade")
+	}
+}
+
+// dropSchemaStatement removes one statement (matched by its opening line) from
+// the canonical schema, failing loudly if the marker is not found so schema
+// drift cannot silently turn this reconstruction into a no-op.
+func dropSchemaStatement(t *testing.T, schema, marker string) string {
+	t.Helper()
+	start := strings.Index(schema, marker)
+	if start < 0 {
+		t.Fatalf("schema marker %q not found", marker)
+	}
+	end := strings.Index(schema[start:], ";")
+	if end < 0 {
+		t.Fatalf("schema statement for %q not terminated", marker)
+	}
+	return schema[:start] + schema[start+end+1:]
+}
