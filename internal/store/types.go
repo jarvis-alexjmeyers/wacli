@@ -79,8 +79,14 @@ type Message struct {
 	FromMe          bool
 	Text            string
 	DisplayText     string
-	QuotedMsgID     string   `json:"quoted_msg_id,omitempty"`
-	QuotedSenderJID string   `json:"quoted_sender_jid,omitempty"`
+	QuotedMsgID     string `json:"quoted_msg_id,omitempty"`
+	QuotedSenderJID string `json:"quoted_sender_jid,omitempty"`
+	// AITOOLS-927 — provider addressing, TRI-STATE (*bool, not bool).
+	// omitempty on a *bool omits only NIL, so `false` still marshals: "not addressed" and
+	// "we could not tell" stay DIFFERENT on the wire. A plain bool would collapse them and
+	// reintroduce the silent drop this ticket exists to remove.
+	MentionsMe      *bool    `json:"MentionsMe,omitempty"`
+	RepliesToMe     *bool    `json:"RepliesToMe,omitempty"`
 	Buttons         []Button `json:",omitempty"`
 	IsForwarded     bool
 	ForwardingScore uint32

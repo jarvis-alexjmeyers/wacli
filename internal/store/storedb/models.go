@@ -94,6 +94,8 @@ type Message struct {
 	DisplayText        sql.NullString
 	QuotedMsgID        sql.NullString
 	QuotedSenderJid    sql.NullString
+	MentionsMe         sql.NullInt64
+	RepliesToMe        sql.NullInt64
 	IsForwarded        int64
 	ForwardingScore    int64
 	ReactionToID       sql.NullString

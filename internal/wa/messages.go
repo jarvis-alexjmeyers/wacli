@@ -84,7 +84,11 @@ type ParsedMessage struct {
 	Starred          bool
 	Edited           bool
 	Revoked          bool
-	Call             *ParsedCallEvent
+	// Context is the raw ContextInfo (AITOOLS-927). The derivation needs our own identity and a
+	// LOCAL authorship lookup, neither of which the parse layer has — so carry it up rather than
+	// deriving here with half the inputs.
+	Context *waProto.ContextInfo
+	Call    *ParsedCallEvent
 }
 
 func ParseLiveMessage(evt *events.Message) ParsedMessage {
@@ -173,6 +177,7 @@ func extractWAProto(m *waProto.Message, pm *ParsedMessage) {
 	extractCallLog(m, pm)
 
 	if ctx := contextInfoForMessage(m); ctx != nil {
+		pm.Context = ctx
 		if id := strings.TrimSpace(ctx.GetStanzaID()); id != "" {
 			pm.ReplyToID = id
 		}
