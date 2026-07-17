@@ -5,6 +5,7 @@
 ### Added
 
 - Sync: add opt-in quiet presence mode to suppress initial available-presence and reconnect updates during long-running sync sessions. (#298 - thanks @GodsBoy)
+- Changes: add a monotonic, store-instance-scoped message change cursor with read-only `changes list/status` commands and prune-aware gap detection.
 
 ### Fixed
 

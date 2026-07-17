@@ -80,6 +80,19 @@ func TestBackfillHistoryAddsOlderMessages(t *testing.T) {
 	if oldest.MsgID != "m1" {
 		t.Fatalf("expected oldest m1, got %q", oldest.MsgID)
 	}
+	page, err := a.db.ListMessageChanges(0, 10)
+	if err != nil {
+		t.Fatalf("ListMessageChanges: %v", err)
+	}
+	foundHistory := false
+	for _, change := range page.Changes {
+		if change.MsgID == "m1" && change.Origin == "history" {
+			foundHistory = true
+		}
+	}
+	if !foundHistory {
+		t.Fatalf("backfill did not emit a history-origin change: %+v", page.Changes)
+	}
 	if got := f.manualHistorySyncCalls; len(got) != 4 || !got[0] || !got[1] || got[2] || got[3] {
 		t.Fatalf("manual history sync calls = %v, want [true true false false]", got)
 	}

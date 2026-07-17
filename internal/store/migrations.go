@@ -1,6 +1,7 @@
 package store
 
 import (
+	"crypto/rand"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -34,6 +35,92 @@ var schemaMigrations = []migration{
 	{version: 18, name: "chat unread count column", up: migrateChatUnreadCountColumn},
 	{version: 19, name: "messages quoted columns", up: migrateMessagesQuotedColumns},
 	{version: 20, name: "messages media_unavailable_at column", up: migrateMessagesMediaUnavailableColumn},
+	{version: 21, name: "message changes", up: migrateMessageChanges},
+}
+
+func migrateMessageChanges(d *DB) error {
+	hasMessages, err := d.tableExists("messages")
+	if err != nil {
+		return err
+	}
+	if hasMessages {
+		hasOrigin, err := d.tableHasColumn("messages", "ingest_origin")
+		if err != nil {
+			return err
+		}
+		if !hasOrigin {
+			if _, err := d.sql.Exec(`ALTER TABLE messages ADD COLUMN ingest_origin TEXT NOT NULL DEFAULT 'live'`); err != nil {
+				return fmt.Errorf("add messages.ingest_origin column: %w", err)
+			}
+		}
+	}
+
+	hasMeta, err := d.tableExists("store_meta")
+	if err != nil {
+		return err
+	}
+	if !hasMeta {
+		if _, err := d.sql.Exec(`
+			CREATE TABLE store_meta (
+				key TEXT PRIMARY KEY,
+				value TEXT NOT NULL
+			)
+		`); err != nil {
+			return fmt.Errorf("create store_meta table: %w", err)
+		}
+	}
+
+	hasChanges, err := d.tableExists("message_changes")
+	if err != nil {
+		return err
+	}
+	if !hasChanges {
+		if _, err := d.sql.Exec(`
+			CREATE TABLE message_changes (
+				seq INTEGER PRIMARY KEY AUTOINCREMENT,
+				chat_jid TEXT NOT NULL,
+				msg_id TEXT NOT NULL,
+				kind TEXT NOT NULL,
+				origin TEXT NOT NULL,
+				ts INTEGER NOT NULL,
+				from_me INTEGER NOT NULL,
+				created_at INTEGER NOT NULL
+			)
+		`); err != nil {
+			return fmt.Errorf("create message_changes table: %w", err)
+		}
+	}
+	if _, err := d.sql.Exec(`CREATE INDEX IF NOT EXISTS idx_message_changes_created_at ON message_changes(created_at)`); err != nil {
+		return fmt.Errorf("create message_changes created-at index: %w", err)
+	}
+
+	var instanceID string
+	err = d.sql.QueryRow(`SELECT value FROM store_meta WHERE key = 'store_instance_id'`).Scan(&instanceID)
+	if errors.Is(err, sql.ErrNoRows) {
+		instanceID, err = newStoreInstanceID()
+		if err != nil {
+			return err
+		}
+		if _, err := d.sql.Exec(`INSERT OR IGNORE INTO store_meta(key, value) VALUES('store_instance_id', ?)`, instanceID); err != nil {
+			return fmt.Errorf("seed store instance ID: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("read store instance ID: %w", err)
+	}
+	if _, err := d.sql.Exec(`INSERT OR IGNORE INTO store_meta(key, value) VALUES('changes_last_pruned_seq', '0')`); err != nil {
+		return fmt.Errorf("seed changes prune cursor: %w", err)
+	}
+	return nil
+}
+
+func newStoreInstanceID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("mint store instance ID: %w", err)
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }
 
 func migrateMessagesMediaUnavailableColumn(d *DB) error {
@@ -129,6 +216,9 @@ func (d *DB) ensureCurrentSchema() error {
 	}
 	if err := migrateMessagesMediaUnavailableColumn(d); err != nil {
 		return fmt.Errorf("ensure current messages media unavailable column: %w", err)
+	}
+	if err := migrateMessageChanges(d); err != nil {
+		return fmt.Errorf("ensure current message changes schema: %w", err)
 	}
 	return nil
 }

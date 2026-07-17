@@ -8,7 +8,7 @@ Read when: inspecting local SQLite size/counts or pruning old local chat/group r
 
 ```bash
 wacli store stats
-wacli store cleanup [--days N] [--dry-run] [--confirm]
+wacli store cleanup [--days N] [--changes-days N] [--dry-run] [--confirm]
 ```
 
 Related cleanup commands:
@@ -23,6 +23,7 @@ wacli groups prune [--days N] [--left-only=false|--include-active] [--dry-run] [
 - `store stats` reads local counts for chats, groups, left groups, and normal chat messages.
 - Status broadcasts are persisted separately in `status_messages`; they are not chat rows and are not included in normal chat/message cleanup paths.
 - `store cleanup` removes chats whose known local activity is older than `--days` and deletes their messages through the SQLite chat/message cascade.
+- `store cleanup` also prunes message change records older than `--changes-days` (default: 30). The prune cursor advances atomically so stale consumers fail with `cursor_gap` instead of silently skipping data.
 - `chats cleanup --jid JID` removes one local chat row and its local messages.
 - `groups prune` removes local group metadata plus the matching local chat/messages for pruned group JIDs.
 - `groups prune` defaults to groups you have left. `--days N` limits that to groups left more than `N` days ago.
@@ -36,7 +37,7 @@ wacli groups prune [--days N] [--left-only=false|--include-active] [--dry-run] [
 
 ```bash
 wacli store stats
-wacli store cleanup --days 365 --dry-run
+wacli store cleanup --days 365 --changes-days 30 --dry-run
 wacli chats cleanup --jid 1234567890@s.whatsapp.net --dry-run
 wacli groups prune --dry-run
 wacli groups prune --days 180 --dry-run

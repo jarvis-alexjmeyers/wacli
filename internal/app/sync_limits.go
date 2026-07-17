@@ -16,15 +16,15 @@ type syncStorageLimits struct {
 	err error
 }
 
-func (l *syncStorageLimits) StoreParsedMessage(ctx context.Context, pm wa.ParsedMessage) error {
+func (l *syncStorageLimits) StoreParsedMessage(ctx context.Context, pm wa.ParsedMessage, origin string) error {
 	if l == nil || (l.opts.MaxMessages <= 0 && l.opts.MaxDBSizeBytes <= 0) {
-		return l.app.storeParsedMessage(ctx, pm)
+		return l.app.storeParsedMessageWithOrigin(ctx, pm, origin)
 	}
 	if err := l.app.checkSyncStorageLimits(l.opts); err != nil {
 		l.setErr(err)
 		return err
 	}
-	if err := l.app.storeParsedMessage(ctx, pm); err != nil {
+	if err := l.app.storeParsedMessageWithOrigin(ctx, pm, origin); err != nil {
 		return err
 	}
 	if err := l.app.checkSyncStorageLimits(l.opts); err != nil {

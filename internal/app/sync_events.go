@@ -367,7 +367,7 @@ func (a *App) handleLiveSyncMessage(ctx context.Context, opts SyncOptions, v *ev
 		a.decryptEncryptedReaction(ctx, &pm, v)
 	}
 	incrementUnread := a.shouldIncrementLiveUnread(ctx, pm)
-	if err := a.storeParsedMessageForSync(ctx, pm, limits...); err == nil {
+	if err := a.storeParsedMessageForSync(ctx, pm, "", limits...); err == nil {
 		if incrementUnread {
 			a.incrementLiveUnread(ctx, pm)
 		}
@@ -450,7 +450,7 @@ func (a *App) handleHistorySync(ctx context.Context, opts SyncOptions, v *events
 					a.decryptEncryptedReaction(ctx, &pm, evt)
 				}
 			}
-			if err := a.storeParsedMessageForSync(ctx, pm, limits...); err == nil {
+			if err := a.storeParsedMessageForSync(ctx, pm, "history", limits...); err == nil {
 				a.emitSyncProgress(messagesStored.Add(1))
 				if pm.Poll != nil || pm.PollAdd != nil || pm.PollVote != nil {
 					pendingPolls = append(pendingPolls, historyPollSideEffect{pm: pm, evt: pollEvt, hist: m.Message})
@@ -558,11 +558,11 @@ func (a *App) emitSyncProgress(total int64) {
 	a.emitOrPrint("progress", map[string]any{"messages_synced": total}, "\rSynced %d messages...", total)
 }
 
-func (a *App) storeParsedMessageForSync(ctx context.Context, pm wa.ParsedMessage, limits ...*syncStorageLimits) error {
+func (a *App) storeParsedMessageForSync(ctx context.Context, pm wa.ParsedMessage, origin string, limits ...*syncStorageLimits) error {
 	if len(limits) > 0 && limits[0] != nil {
-		return limits[0].StoreParsedMessage(ctx, pm)
+		return limits[0].StoreParsedMessage(ctx, pm, origin)
 	}
-	return a.storeParsedMessage(ctx, pm)
+	return a.storeParsedMessageWithOrigin(ctx, pm, origin)
 }
 
 func (a *App) decryptEncryptedReaction(ctx context.Context, pm *wa.ParsedMessage, msg *events.Message) {

@@ -111,6 +111,13 @@ func TestLiveSyncIncrementsUnreadCountForIncomingMessages(t *testing.T) {
 	if !c.Unread || c.UnreadCount != 1 {
 		t.Fatalf("unread state after duplicate incoming message = %+v, want count 1", c)
 	}
+	page, err := a.db.ListMessageChanges(0, 10)
+	if err != nil {
+		t.Fatalf("ListMessageChanges: %v", err)
+	}
+	if len(page.Changes) != 1 || page.Changes[0].Origin != "live" {
+		t.Fatalf("live changes = %+v", page.Changes)
+	}
 }
 
 func TestSyncEventHandlerClearsUnreadCountOnReadSelfReceipt(t *testing.T) {
@@ -278,6 +285,13 @@ func TestHistorySyncStoresConversationUnreadCount(t *testing.T) {
 	}
 	if !c.Unread || c.UnreadCount != 3 {
 		t.Fatalf("unread state after history sync = %+v, want count 3", c)
+	}
+	page, err := a.db.ListMessageChanges(0, 10)
+	if err != nil {
+		t.Fatalf("ListMessageChanges: %v", err)
+	}
+	if len(page.Changes) != 1 || page.Changes[0].Origin != "history" {
+		t.Fatalf("history changes = %+v", page.Changes)
 	}
 }
 

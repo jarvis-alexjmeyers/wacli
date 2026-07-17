@@ -13,6 +13,7 @@ import (
 
 func newStoreCleanupCmd(flags *rootFlags) *cobra.Command {
 	var days int
+	var changesDays int
 	var dryRun bool
 	var confirm bool
 	cmd := &cobra.Command{
@@ -22,6 +23,7 @@ func newStoreCleanupCmd(flags *rootFlags) *cobra.Command {
 
 Removes chats with no recent activity and their associated messages.
 Use --days to set the threshold (default: 365 days).
+Message change records are pruned separately by --changes-days (default: 30 days).
 Use --dry-run to preview what would be deleted.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := flags.requireWritable(); err != nil {
@@ -43,10 +45,14 @@ Use --dry-run to preview what would be deleted.`,
 			if err != nil {
 				return err
 			}
+			prunableChanges, err := a.DB().CountMessageChangesOlderThan(changesDays)
+			if err != nil {
+				return err
+			}
 
-			if len(chats) == 0 {
+			if len(chats) == 0 && prunableChanges == 0 {
 				if flags.asJSON {
-					return out.WriteJSON(os.Stdout, map[string]any{"deleted": 0, "message": "nothing to clean up"})
+					return out.WriteJSON(os.Stdout, map[string]any{"deleted": 0, "pruned_changes": 0, "message": "nothing to clean up"})
 				}
 				fmt.Fprintln(os.Stderr, "Nothing to clean up.")
 				return nil
@@ -63,7 +69,9 @@ Use --dry-run to preview what would be deleted.`,
 					return out.WriteJSON(os.Stdout, map[string]any{
 						"would_delete_chats":    len(chats),
 						"would_delete_messages": totalMessages,
+						"would_prune_changes":   prunableChanges,
 						"days":                  days,
+						"changes_days":          changesDays,
 					})
 				}
 				fmt.Fprintf(os.Stderr, "Would delete %d chat(s) with %d total message(s) (older than %d days):\n", len(chats), totalMessages, days)
@@ -75,12 +83,13 @@ Use --dry-run to preview what would be deleted.`,
 					count, _ := a.DB().CountChatMessages(c.JID)
 					fmt.Fprintf(os.Stderr, "  - %s (%s, %d messages)\n", name, c.JID, count)
 				}
+				fmt.Fprintf(os.Stderr, "Would prune %d message change record(s) older than %d days.\n", prunableChanges, changesDays)
 				fmt.Fprintln(os.Stderr, "\nRun without --dry-run to actually delete.")
 				return nil
 			}
 
 			if !confirm {
-				fmt.Fprintf(os.Stderr, "About to delete %d chat(s) with %d total message(s). This cannot be undone.\n", len(chats), totalMessages)
+				fmt.Fprintf(os.Stderr, "About to delete %d chat(s) with %d total message(s) and prune %d message change record(s). This cannot be undone.\n", len(chats), totalMessages, prunableChanges)
 				fmt.Fprint(os.Stderr, "Continue? [y/N] ")
 				reader := bufio.NewReader(os.Stdin)
 				answer, _ := reader.ReadString('\n')
@@ -108,18 +117,24 @@ Use --dry-run to preview what would be deleted.`,
 					fmt.Fprintf(os.Stderr, "Deleted %s (%d messages)\n", name, count)
 				}
 			}
+			prunedChanges, err := a.DB().PruneMessageChangesOlderThan(changesDays)
+			if err != nil {
+				return err
+			}
 
 			if flags.asJSON {
 				return out.WriteJSON(os.Stdout, map[string]any{
 					"deleted_chats":    deletedChats,
 					"deleted_messages": deletedMessages,
+					"pruned_changes":   prunedChanges,
 				})
 			}
-			fmt.Fprintf(os.Stderr, "\nDone. Deleted %d chat(s) with %d message(s).\n", deletedChats, deletedMessages)
+			fmt.Fprintf(os.Stderr, "\nDone. Deleted %d chat(s) with %d message(s) and pruned %d message change record(s).\n", deletedChats, deletedMessages, prunedChanges)
 			return nil
 		},
 	}
 	cmd.Flags().IntVar(&days, "days", 365, "delete data older than N days")
+	cmd.Flags().IntVar(&changesDays, "changes-days", 30, "prune message change records older than N days")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "show what would be deleted without deleting")
 	cmd.Flags().BoolVar(&confirm, "confirm", false, "skip confirmation prompt")
 	return cmd

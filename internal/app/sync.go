@@ -396,6 +396,10 @@ func chatKind(chat types.JID) string {
 }
 
 func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error {
+	return a.storeParsedMessageWithOrigin(ctx, pm, "")
+}
+
+func (a *App) storeParsedMessageWithOrigin(ctx context.Context, pm wa.ParsedMessage, origin string) error {
 	pm.Chat = a.canonicalStoreJID(ctx, pm.Chat)
 	chatJID := canonicalJIDString(pm.Chat)
 	chatName := a.wa.ResolveChatName(ctx, pm.Chat, pm.PushName)
@@ -537,6 +541,7 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 		FileLength:      fileLen,
 		Edited:          pm.Edited,
 		Revoked:         pm.Revoked,
+		Origin:          origin,
 	}); err != nil {
 		return err
 	}
