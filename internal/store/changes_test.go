@@ -813,3 +813,33 @@ func TestHistoryReplayResolvingAddressingEmitsEdit(t *testing.T) {
 		t.Fatalf("identical history redelivery emitted; changes = %d", len(page.Changes))
 	}
 }
+
+func TestUnseenRevokeAndDeleteTombstonesEmitNothing(t *testing.T) {
+	db := openTestDB(t)
+	chat := "unseen-tombstone@s.whatsapp.net"
+	ts := time.Date(2026, 7, 17, 18, 0, 0, 0, time.UTC)
+	if err := db.UpsertChat(chat, "dm", "Unseen", ts); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	// A revoke for a message the store never held: contentless tombstone row
+	// only, NO change emission (it would be a blank forwardable insert).
+	if err := db.UpsertMessage(UpsertMessageParams{ChatJID: chat, MsgID: "never-seen-revoke", SenderJID: chat, Timestamp: ts, Revoked: true}); err != nil {
+		t.Fatalf("unseen revoke upsert: %v", err)
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{ChatJID: chat, MsgID: "never-seen-delete", SenderJID: chat, Timestamp: ts, DeletedForMe: true}); err != nil {
+		t.Fatalf("unseen delete upsert: %v", err)
+	}
+	page, err := db.ListMessageChanges(0, 10)
+	if err != nil {
+		t.Fatalf("ListMessageChanges: %v", err)
+	}
+	if len(page.Changes) != 0 {
+		t.Fatalf("unseen tombstones emitted %d change(s), want 0: %+v", len(page.Changes), page.Changes)
+	}
+	// Both rows still exist as tombstones.
+	for _, id := range []string{"never-seen-revoke", "never-seen-delete"} {
+		if _, err := db.GetMessage(chat, id); err != nil {
+			t.Fatalf("tombstone %s missing: %v", id, err)
+		}
+	}
+}

@@ -171,7 +171,7 @@ func migrateLIDMessagesToPN(tx *sql.Tx, lidJID, pnJID string) error {
 	if _, err := tx.Exec(`
 		INSERT INTO messages(
 			chat_jid, chat_name, msg_id, sender_jid, sender_name, ts, from_me, text, display_text,
-			quoted_msg_id, quoted_sender_jid, mentions_me, replies_to_me,
+			quoted_msg_id, quoted_sender_jid, mentions_me, replies_to_me, ingest_origin,
 			is_forwarded, forwarding_score, reaction_to_id, reaction_emoji,
 			media_type, media_caption, filename, mime_type, direct_path,
 			media_key, file_sha256, file_enc_sha256, file_length, local_path, downloaded_at,
@@ -191,6 +191,7 @@ func migrateLIDMessagesToPN(tx *sql.Tx, lidJID, pnJID string) error {
 			CASE WHEN revoked != 0 OR deleted_for_me != 0 THEN NULL WHEN quoted_sender_jid = ? THEN ? ELSE quoted_sender_jid END,
 			CASE WHEN revoked != 0 OR deleted_for_me != 0 THEN NULL ELSE mentions_me END,
 			CASE WHEN revoked != 0 OR deleted_for_me != 0 THEN NULL ELSE replies_to_me END,
+			ingest_origin,
 			is_forwarded,
 			forwarding_score,
 			reaction_to_id,
@@ -225,6 +226,7 @@ func migrateLIDMessagesToPN(tx *sql.Tx, lidJID, pnJID string) error {
 			quoted_sender_jid = CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL ELSE COALESCE(NULLIF(messages.quoted_sender_jid, ''), excluded.quoted_sender_jid) END,
 			mentions_me = CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN messages.mentions_me IS NULL THEN excluded.mentions_me WHEN excluded.mentions_me IS NULL THEN messages.mentions_me WHEN excluded.edited != 0 AND messages.edited = 0 THEN excluded.mentions_me WHEN messages.edited != 0 AND excluded.edited = 0 THEN messages.mentions_me WHEN excluded.edited != 0 AND messages.edited != 0 AND excluded.edited_ts > messages.edited_ts THEN excluded.mentions_me WHEN messages.edited != 0 AND excluded.edited != 0 THEN messages.mentions_me WHEN excluded.ts > messages.ts THEN excluded.mentions_me ELSE messages.mentions_me END,
 			replies_to_me = CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN messages.replies_to_me IS NULL THEN excluded.replies_to_me WHEN excluded.replies_to_me IS NULL THEN messages.replies_to_me WHEN excluded.edited != 0 AND messages.edited = 0 THEN excluded.replies_to_me WHEN messages.edited != 0 AND excluded.edited = 0 THEN messages.replies_to_me WHEN excluded.edited != 0 AND messages.edited != 0 AND excluded.edited_ts > messages.edited_ts THEN excluded.replies_to_me WHEN messages.edited != 0 AND excluded.edited != 0 THEN messages.replies_to_me WHEN excluded.ts > messages.ts THEN excluded.replies_to_me ELSE messages.replies_to_me END,
+			ingest_origin = CASE WHEN messages.ingest_origin = 'live' OR excluded.ingest_origin = 'live' THEN 'live' ELSE 'history' END,
 			is_forwarded = CASE WHEN messages.is_forwarded != 0 THEN messages.is_forwarded ELSE excluded.is_forwarded END,
 			forwarding_score = max(messages.forwarding_score, excluded.forwarding_score),
 			reaction_to_id = COALESCE(NULLIF(messages.reaction_to_id, ''), excluded.reaction_to_id),

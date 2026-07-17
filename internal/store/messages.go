@@ -88,6 +88,12 @@ func (d *DB) UpsertMessage(p UpsertMessageParams) error {
 
 	kind := ""
 	switch {
+	case !priorExists && (current.revoked || current.deletedForMe):
+		// A revoke/delete for a message the store never held inserts only a
+		// contentless tombstone row. Emitting it as insert/live would push a
+		// blank tombstone into the consumer's forwardable lane (the unseen
+		// delete-for-me fallback already suppresses this; unseen revokes must
+		// match — exact-head gate P1).
 	case !priorExists:
 		kind = "insert"
 	// Revoke/delete transitions outrank the history->live upgrade: a live
