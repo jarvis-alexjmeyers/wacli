@@ -40,7 +40,7 @@ func newChangesListCmd(flags *rootFlags) *cobra.Command {
 			}
 			ctx, cancel := withTimeout(context.Background(), flags)
 			defer cancel()
-			a, lk, err := newApp(ctx, flags, false, false)
+			a, lk, err := newReadOnlyApp(ctx, flags, false)
 			if err != nil {
 				return err
 			}
@@ -72,7 +72,7 @@ func newChangesStatusCmd(flags *rootFlags) *cobra.Command {
 			}
 			ctx, cancel := withTimeout(context.Background(), flags)
 			defer cancel()
-			a, lk, err := newApp(ctx, flags, false, false)
+			a, lk, err := newReadOnlyApp(ctx, flags, false)
 			if err != nil {
 				return err
 			}

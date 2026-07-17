@@ -115,6 +115,18 @@ func writeRootError(flags rootFlags, err error) {
 }
 
 func newApp(ctx context.Context, flags *rootFlags, needLock bool, allowUnauthed bool) (*app.App, *lock.Lock, error) {
+	return newAppReadOnlyForced(ctx, flags, needLock, allowUnauthed, false)
+}
+
+// newReadOnlyApp opens the store read-only regardless of --read-only, for
+// commands that must never write (e.g. `changes`, polled by an edge consumer
+// beside the sync --follow daemon — a read-write open would run ensureSchema
+// DDL and contend for the WAL writer on every poll tick).
+func newReadOnlyApp(ctx context.Context, flags *rootFlags, allowUnauthed bool) (*app.App, *lock.Lock, error) {
+	return newAppReadOnlyForced(ctx, flags, false, allowUnauthed, true)
+}
+
+func newAppReadOnlyForced(ctx context.Context, flags *rootFlags, needLock bool, allowUnauthed bool, forceReadOnly bool) (*app.App, *lock.Lock, error) {
 	storeDir, err := resolveStoreDir(flags)
 	if err != nil {
 		return nil, nil, err
@@ -134,7 +146,7 @@ func newApp(ctx context.Context, flags *rootFlags, needLock bool, allowUnauthed 
 		JSON:          flags.asJSON,
 		Events:        out.NewEventWriter(os.Stderr, flags.events),
 		AllowUnauthed: allowUnauthed,
-		ReadOnly:      flags.isReadOnly(),
+		ReadOnly:      forceReadOnly || flags.isReadOnly(),
 	})
 	if err != nil {
 		if lk != nil {

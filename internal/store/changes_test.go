@@ -561,3 +561,60 @@ func withStoreNow(t *testing.T, now time.Time) {
 	nowUTC = func() time.Time { return now }
 	t.Cleanup(func() { nowUTC = previous })
 }
+
+func TestLiveRevokeOverHistoryRowEmitsRevokeNotForwardableInsert(t *testing.T) {
+	db := openTestDB(t)
+	chat := "revoke-upgrade@s.whatsapp.net"
+	ts := time.Date(2026, 7, 17, 13, 0, 0, 0, time.UTC)
+	if err := db.UpsertChat(chat, "dm", "RevokeUpgrade", ts); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	msg := UpsertMessageParams{ChatJID: chat, MsgID: "m1", SenderJID: chat, Timestamp: ts, Text: "hello", Origin: "history"}
+	if err := db.UpsertMessage(msg); err != nil {
+		t.Fatalf("history insert: %v", err)
+	}
+	// The live revoke arrives through the same upsert path sync uses
+	// (Origin zero-value = live, Revoked = true).
+	revoke := UpsertMessageParams{ChatJID: chat, MsgID: "m1", SenderJID: chat, Timestamp: ts, Revoked: true}
+	if err := db.UpsertMessage(revoke); err != nil {
+		t.Fatalf("live revoke: %v", err)
+	}
+	if got := messageIngestOrigin(t, db, chat, "m1"); got != "live" {
+		t.Fatalf("ingest origin after live revoke = %q, want live", got)
+	}
+	page, err := db.ListMessageChanges(0, 10)
+	if err != nil {
+		t.Fatalf("ListMessageChanges: %v", err)
+	}
+	if len(page.Changes) != 2 {
+		t.Fatalf("changes = %d, want 2", len(page.Changes))
+	}
+	last := page.Changes[1]
+	if last.Kind != "revoke" {
+		t.Fatalf("live revoke over history row emitted kind=%q origin=%q, want revoke (a forwardable insert here would push a blank tombstone to the consumer)", last.Kind, last.Origin)
+	}
+}
+
+func TestDeletedForMeTombstoneFallbackEmitsNoChange(t *testing.T) {
+	db := openTestDB(t)
+	chat := "tombstone@s.whatsapp.net"
+	ts := time.Date(2026, 7, 17, 13, 30, 0, 0, time.UTC)
+	if err := db.UpsertChat(chat, "dm", "Tombstone", ts); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	// Delete-for-me for a message the store never held: the fallback inserts a
+	// contentless tombstone row and must deliberately emit NO change row.
+	if err := db.MarkMessageDeletedForMe(chat, "never-seen", chat, false, ts); err != nil {
+		t.Fatalf("MarkMessageDeletedForMe fallback: %v", err)
+	}
+	if _, err := db.GetMessage(chat, "never-seen"); err != nil {
+		t.Fatalf("tombstone row missing: %v", err)
+	}
+	page, err := db.ListMessageChanges(0, 10)
+	if err != nil {
+		t.Fatalf("ListMessageChanges: %v", err)
+	}
+	if len(page.Changes) != 0 {
+		t.Fatalf("tombstone fallback emitted %d change(s), want 0", len(page.Changes))
+	}
+}

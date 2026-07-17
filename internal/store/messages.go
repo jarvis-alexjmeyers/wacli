@@ -87,14 +87,18 @@ func (d *DB) UpsertMessage(p UpsertMessageParams) error {
 	switch {
 	case !priorExists:
 		kind = "insert"
-	case prior.ingestOrigin == "history" && origin == "live" && current.ingestOrigin == "live":
-		kind = "insert"
-	case prior.ingestOrigin == "live" && origin == "history":
-		// History must never supersede a durable live delivery in the stream.
+	// Revoke/delete transitions outrank the history->live upgrade: a live
+	// revoke over a history-origin row still flips ingest_origin, but its
+	// change kind must stay 'revoke' — emitting it as insert(origin='live')
+	// would push a blank tombstone into the consumer's forwardable lane.
 	case !prior.revoked && current.revoked:
 		kind = "revoke"
 	case !prior.deletedForMe && current.deletedForMe:
 		kind = "delete"
+	case prior.ingestOrigin == "history" && origin == "live" && current.ingestOrigin == "live":
+		kind = "insert"
+	case prior.ingestOrigin == "live" && origin == "history":
+		// History must never supersede a durable live delivery in the stream.
 	case prior.text != current.text || prior.displayText != current.displayText || (!prior.edited && current.edited) || prior.editedTS != current.editedTS:
 		kind = "edit"
 	}
@@ -208,6 +212,10 @@ func (d *DB) MarkMessageDeletedForMe(chatJID, msgID, senderJID string, fromMe bo
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
+	// Deliberately NON-emitting: a delete-for-me for a message the store never
+	// held inserts a contentless tombstone row only. There is nothing a change
+	// consumer could act on — no content existed at any seq — and an
+	// insert-kind change here would push a blank row into the forwardable lane.
 	params := prepareUpsertMessage(UpsertMessageParams{
 		ChatJID:      chatJID,
 		MsgID:        msgID,
