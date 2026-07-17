@@ -41,10 +41,13 @@ type UpsertMessageParams struct {
 	Revoked         bool
 	DeletedForMe    bool
 	Origin          string
+	// TRI-STATE: nil = we could not derive it. Never persisted as a bare false.
+	MentionsMe  *bool
+	RepliesToMe *bool
 }
 
 func messageSelectColumns(snippet string) string {
-	return fmt.Sprintf(`m.rowid, m.chat_jid, COALESCE(c.name,''), m.msg_id, COALESCE(m.sender_jid,''), COALESCE(m.sender_name,''), m.ts, m.from_me, COALESCE(m.text,''), COALESCE(m.display_text,''), COALESCE(m.quoted_msg_id,''), COALESCE(m.quoted_sender_jid,''), m.is_forwarded, m.forwarding_score, COALESCE(m.reaction_to_id,''), COALESCE(m.reaction_emoji,''), COALESCE(m.media_type,''), COALESCE(m.media_caption,''), COALESCE(m.filename,''), COALESCE(m.mime_type,''), COALESCE(m.direct_path,''), COALESCE(m.local_path,''), COALESCE(m.downloaded_at,0), CASE WHEN s.msg_id IS NULL THEN 0 ELSE 1 END, COALESCE(s.starred_at,0), m.revoked, m.deleted_for_me, COALESCE(m.buttons,''), %s`, snippetSQL(snippet))
+	return fmt.Sprintf(`m.rowid, m.chat_jid, COALESCE(c.name,''), m.msg_id, COALESCE(m.sender_jid,''), COALESCE(m.sender_name,''), m.ts, m.from_me, COALESCE(m.text,''), COALESCE(m.display_text,''), COALESCE(m.quoted_msg_id,''), COALESCE(m.quoted_sender_jid,''), m.mentions_me, m.replies_to_me, m.is_forwarded, m.forwarding_score, COALESCE(m.reaction_to_id,''), COALESCE(m.reaction_emoji,''), COALESCE(m.media_type,''), COALESCE(m.media_caption,''), COALESCE(m.filename,''), COALESCE(m.mime_type,''), COALESCE(m.direct_path,''), COALESCE(m.local_path,''), COALESCE(m.downloaded_at,0), CASE WHEN s.msg_id IS NULL THEN 0 ELSE 1 END, COALESCE(s.starred_at,0), m.revoked, m.deleted_for_me, COALESCE(m.buttons,''), %s`, snippetSQL(snippet))
 }
 
 func snippetSQL(snippet string) string {
@@ -97,9 +100,17 @@ func (d *DB) UpsertMessage(p UpsertMessageParams) error {
 		kind = "delete"
 	case prior.ingestOrigin == "history" && origin == "live" && current.ingestOrigin == "live":
 		kind = "insert"
-	case prior.ingestOrigin == "live" && origin == "history":
-		// History must never supersede a durable live delivery in the stream.
-	case prior.text != current.text || prior.displayText != current.displayText || (!prior.edited && current.edited) || prior.editedTS != current.editedTS:
+	case prior.ingestOrigin == "live" && origin == "history" &&
+		!messageAddressingChanged(prior.mentionsMe, current.mentionsMe) &&
+		!messageAddressingChanged(prior.repliesToMe, current.repliesToMe):
+		// History must never supersede a durable live delivery in the stream —
+		// but a history replay that RESOLVES an addressing verdict (the quoted
+		// message arrived via backfill, so RepliesToMe NULL→true persists via
+		// the upsert) must still record an edit: suppressing it here would
+		// erase the only event an edit-aware consumer could ever observe
+		// (exact-head gate P1).
+	case prior.text != current.text || prior.displayText != current.displayText || (!prior.edited && current.edited) || prior.editedTS != current.editedTS ||
+		messageAddressingChanged(prior.mentionsMe, current.mentionsMe) || messageAddressingChanged(prior.repliesToMe, current.repliesToMe):
 		kind = "edit"
 	}
 	if kind != "" {
@@ -153,6 +164,8 @@ func prepareUpsertMessage(p UpsertMessageParams, origin string) storedb.UpsertMe
 		DisplayText:     nullString(p.DisplayText),
 		QuotedMsgID:     nullString(p.QuotedMsgID),
 		QuotedSenderJid: nullString(p.QuotedSenderJID),
+		MentionsMe:      boolPtrToNullInt64(p.MentionsMe),
+		RepliesToMe:     boolPtrToNullInt64(p.RepliesToMe),
 		IsForwarded:     boolToInt64(p.IsForwarded),
 		ForwardingScore: int64(p.ForwardingScore),
 		ReactionToID:    nullString(p.ReactionToID),
@@ -271,6 +284,8 @@ type messageChangeState struct {
 	msgID        string
 	text         string
 	displayText  string
+	mentionsMe   sql.NullInt64
+	repliesToMe  sql.NullInt64
 	revoked      bool
 	deletedForMe bool
 	edited       bool
@@ -304,11 +319,12 @@ func readMessageChangeState(tx *sql.Tx, chatJID, msgID string) (messageChangeSta
 	var revoked, deletedForMe, edited, fromMe int
 	err := tx.QueryRowContext(storeCtx(), `
 		SELECT chat_jid, msg_id, COALESCE(text,''), COALESCE(display_text,''),
-		       revoked, deleted_for_me, edited, edited_ts, ingest_origin, ts, from_me
+		       mentions_me, replies_to_me, revoked, deleted_for_me, edited, edited_ts, ingest_origin, ts, from_me
 		FROM messages
 		WHERE chat_jid = ? AND msg_id = ?
 	`, chatJID, msgID).Scan(
 		&state.chatJID, &state.msgID, &state.text, &state.displayText,
+		&state.mentionsMe, &state.repliesToMe,
 		&revoked, &deletedForMe, &edited, &state.editedTS, &state.ingestOrigin, &state.ts, &fromMe,
 	)
 	if err != nil {
@@ -319,6 +335,13 @@ func readMessageChangeState(tx *sql.Tx, chatJID, msgID string) (messageChangeSta
 	state.edited = edited != 0
 	state.fromMe = fromMe != 0
 	return state, nil
+}
+
+func messageAddressingChanged(prior, current sql.NullInt64) bool {
+	if !prior.Valid {
+		return current.Valid
+	}
+	return current.Valid && (prior.Int64 != 0) != (current.Int64 != 0)
 }
 
 func appendMessageChange(tx *sql.Tx, kind, origin string, state messageChangeState) error {
@@ -553,10 +576,15 @@ func (d *DB) scanMessages(query string, args ...interface{}) ([]Message, error) 
 		var revoked int
 		var deletedForMe int
 		var buttonsJSON string
-		if err := rows.Scan(&m.rowID, &m.ChatJID, &m.ChatName, &m.MsgID, &m.SenderJID, &m.SenderName, &ts, &fromMe, &m.Text, &m.DisplayText, &m.QuotedMsgID, &m.QuotedSenderJID, &forwarded, &forwardingScore, &m.ReactionToID, &m.ReactionEmoji, &m.MediaType, &m.MediaCaption, &m.Filename, &m.MimeType, &m.DirectPath, &m.LocalPath, &downloadedAt, &starred, &starredAt, &revoked, &deletedForMe, &buttonsJSON, &m.Snippet); err != nil {
+		var mentionsMe sql.NullInt64
+		var repliesToMe sql.NullInt64
+		if err := rows.Scan(&m.rowID, &m.ChatJID, &m.ChatName, &m.MsgID, &m.SenderJID, &m.SenderName, &ts, &fromMe, &m.Text, &m.DisplayText, &m.QuotedMsgID, &m.QuotedSenderJID, &mentionsMe, &repliesToMe, &forwarded, &forwardingScore, &m.ReactionToID, &m.ReactionEmoji, &m.MediaType, &m.MediaCaption, &m.Filename, &m.MimeType, &m.DirectPath, &m.LocalPath, &downloadedAt, &starred, &starredAt, &revoked, &deletedForMe, &buttonsJSON, &m.Snippet); err != nil {
 			return nil, err
 		}
 		m.Timestamp = fromUnix(ts)
+		// NULL stays nil (unknown), never false. SQLite has no bool: 0/1 -> *bool.
+		m.MentionsMe = nullInt64ToBoolPtr(mentionsMe)
+		m.RepliesToMe = nullInt64ToBoolPtr(repliesToMe)
 		m.FromMe = fromMe != 0
 		m.IsForwarded = forwarded != 0
 		m.ForwardingScore = uint32(forwardingScore)
@@ -576,37 +604,37 @@ func (d *DB) scanMessages(query string, args ...interface{}) ([]Message, error) 
 func messageFromGetRow(row storedb.GetMessageRow) Message {
 	return messageFromScalars(
 		row.Rowid, row.ChatJid, row.Name, row.MsgID, row.SenderJid, row.SenderName,
-		row.Ts, row.FromMe, row.Text, row.DisplayText, row.QuotedMsgID, row.QuotedSenderJid, row.IsForwarded,
+		row.Ts, row.FromMe, row.Text, row.DisplayText, row.QuotedMsgID, row.QuotedSenderJid, row.MentionsMe, row.RepliesToMe, row.IsForwarded,
 		row.ForwardingScore, row.ReactionToID, row.ReactionEmoji, row.MediaType,
 		row.MediaCaption, row.Filename, row.MimeType, row.DirectPath, row.LocalPath,
-		row.DownloadedAt, row.Column24, row.StarredAt, row.Revoked, row.DeletedForMe,
-		row.Buttons, row.Column29,
+		row.DownloadedAt, row.Column26, row.StarredAt, row.Revoked, row.DeletedForMe,
+		row.Buttons, row.Column31,
 	)
 }
 
 func messageFromBeforeRow(row storedb.MessageContextBeforeRow) Message {
 	return messageFromScalars(
 		row.Rowid, row.ChatJid, row.Name, row.MsgID, row.SenderJid, row.SenderName,
-		row.Ts, row.FromMe, row.Text, row.DisplayText, row.QuotedMsgID, row.QuotedSenderJid, row.IsForwarded,
+		row.Ts, row.FromMe, row.Text, row.DisplayText, row.QuotedMsgID, row.QuotedSenderJid, row.MentionsMe, row.RepliesToMe, row.IsForwarded,
 		row.ForwardingScore, row.ReactionToID, row.ReactionEmoji, row.MediaType,
 		row.MediaCaption, row.Filename, row.MimeType, row.DirectPath, row.LocalPath,
-		row.DownloadedAt, row.Column24, row.StarredAt, row.Revoked, row.DeletedForMe,
-		row.Buttons, row.Column29,
+		row.DownloadedAt, row.Column26, row.StarredAt, row.Revoked, row.DeletedForMe,
+		row.Buttons, row.Column31,
 	)
 }
 
 func messageFromAfterRow(row storedb.MessageContextAfterRow) Message {
 	return messageFromScalars(
 		row.Rowid, row.ChatJid, row.Name, row.MsgID, row.SenderJid, row.SenderName,
-		row.Ts, row.FromMe, row.Text, row.DisplayText, row.QuotedMsgID, row.QuotedSenderJid, row.IsForwarded,
+		row.Ts, row.FromMe, row.Text, row.DisplayText, row.QuotedMsgID, row.QuotedSenderJid, row.MentionsMe, row.RepliesToMe, row.IsForwarded,
 		row.ForwardingScore, row.ReactionToID, row.ReactionEmoji, row.MediaType,
 		row.MediaCaption, row.Filename, row.MimeType, row.DirectPath, row.LocalPath,
-		row.DownloadedAt, row.Column24, row.StarredAt, row.Revoked, row.DeletedForMe,
-		row.Buttons, row.Column29,
+		row.DownloadedAt, row.Column26, row.StarredAt, row.Revoked, row.DeletedForMe,
+		row.Buttons, row.Column31,
 	)
 }
 
-func messageFromScalars(rowID int64, chatJID, chatName, msgID, senderJID, senderName string, ts, fromMe int64, text, displayText, quotedMsgID, quotedSenderJID string, forwarded, forwardingScore int64, reactionToID, reactionEmoji, mediaType, mediaCaption, filename, mimeType, directPath, localPath string, downloadedAt, starred, starredAt, revoked, deletedForMe int64, buttonsJSON, snippet string) Message {
+func messageFromScalars(rowID int64, chatJID, chatName, msgID, senderJID, senderName string, ts, fromMe int64, text, displayText, quotedMsgID, quotedSenderJID string, mentionsMe, repliesToMe sql.NullInt64, forwarded, forwardingScore int64, reactionToID, reactionEmoji, mediaType, mediaCaption, filename, mimeType, directPath, localPath string, downloadedAt, starred, starredAt, revoked, deletedForMe int64, buttonsJSON, snippet string) Message {
 	m := Message{
 		rowID:           rowID,
 		ChatJID:         chatJID,
@@ -620,6 +648,8 @@ func messageFromScalars(rowID int64, chatJID, chatName, msgID, senderJID, sender
 		DisplayText:     displayText,
 		QuotedMsgID:     quotedMsgID,
 		QuotedSenderJID: quotedSenderJID,
+		MentionsMe:      nullInt64ToBoolPtr(mentionsMe),
+		RepliesToMe:     nullInt64ToBoolPtr(repliesToMe),
 		IsForwarded:     forwarded != 0,
 		ForwardingScore: uint32(forwardingScore),
 		ReactionToID:    reactionToID,
@@ -663,4 +693,56 @@ func messageInfoFromLatestRow(row storedb.GetLatestMessageInfoRow) MessageInfo {
 		SenderJID:  row.SenderJid,
 		SenderName: row.SenderName,
 	}
+}
+
+// nullInt64ToBoolPtr maps a nullable SQLite integer to a tri-state bool.
+//
+// NULL -> nil (unknown), NOT false. Collapsing NULL to false would assert "you were not
+// addressed" about a message we never managed to examine.
+func nullInt64ToBoolPtr(v sql.NullInt64) *bool {
+	if !v.Valid {
+		return nil
+	}
+	b := v.Int64 != 0
+	return &b
+}
+
+// boolPtrToNullInt64 maps a tri-state bool to a nullable SQLite integer (nil -> NULL).
+func boolPtrToNullInt64(v *bool) sql.NullInt64 {
+	if v == nil {
+		return sql.NullInt64{}
+	}
+	n := int64(0)
+	if *v {
+		n = 1
+	}
+	return sql.NullInt64{Int64: n, Valid: true}
+}
+
+// MessageAuthorship reports whether we hold a local record of a message, and whether WE wrote it.
+//
+// This is the proof behind RepliesToMe (AITOOLS-927). ContextInfo.participant is an attacker-supplied
+// CLAIM that Wave authored the quoted message; only our own store can corroborate it. Keyed on
+// (chat_jid, msg_id) — never msg_id alone, or the same id in a DIFFERENT chat would forge the proof.
+//
+// found=false means "no record", which the caller must treat as UNRESOLVED (null) — never as a
+// confirmed authorship and never as a confirmed denial. (Unresolved is not "held for replay": no
+// durable hold exists yet.)
+func (d *DB) MessageAuthorship(chatJID, msgID string) (found bool, fromMe bool, err error) {
+	chatJID = strings.TrimSpace(chatJID)
+	msgID = strings.TrimSpace(msgID)
+	if chatJID == "" || msgID == "" {
+		return false, false, nil
+	}
+	var fm int64
+	err = d.sql.QueryRow(
+		`SELECT from_me FROM messages WHERE chat_jid = ? AND msg_id = ?`, chatJID, msgID,
+	).Scan(&fm)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	return true, fm != 0, nil
 }

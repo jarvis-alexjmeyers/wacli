@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -28,14 +29,13 @@ func TestChangesListCommandWritesStandardJSONEnvelopeReadOnly(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	flags := &rootFlags{storeDir: storeDir, asJSON: true, readOnly: true, timeout: time.Minute}
+	var executeErr error
 	raw := captureRootStdout(t, func() {
-		cmd := newChangesListCmd(flags)
-		cmd.SetArgs([]string{"--after-seq", "0", "--limit", "10"})
-		if err := cmd.Execute(); err != nil {
-			t.Fatalf("changes list: %v", err)
-		}
+		executeErr = execute([]string{"--store", storeDir, "--read-only", "--json", "changes", "list", "--after-seq", "0", "--limit", "10"})
 	})
+	if executeErr != nil {
+		t.Fatalf("execute changes list: %v", executeErr)
+	}
 	var envelope struct {
 		Success bool `json:"success"`
 		Data    struct {
@@ -53,6 +53,77 @@ func TestChangesListCommandWritesStandardJSONEnvelopeReadOnly(t *testing.T) {
 	}
 	if len(envelope.Data.Changes) != 1 || envelope.Data.Changes[0].Message == nil || envelope.Data.Purged != 0 {
 		t.Fatalf("data = %+v", envelope.Data)
+	}
+}
+
+func TestChangesListCommandPreservesProviderAddressingTriStateJSON(t *testing.T) {
+	storeDir := t.TempDir()
+	db, err := store.Open(filepath.Join(storeDir, "wacli.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	chat := "changes-addressing@s.whatsapp.net"
+	now := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	if err := db.UpsertChat(chat, "dm", "Addressing", now); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	mentionsMe := true
+	repliesToMe := false
+	if err := db.UpsertMessage(store.UpsertMessageParams{
+		ChatJID:     chat,
+		MsgID:       "derived",
+		Timestamp:   now,
+		MentionsMe:  &mentionsMe,
+		RepliesToMe: &repliesToMe,
+	}); err != nil {
+		t.Fatalf("derived insert: %v", err)
+	}
+	if err := db.UpsertMessage(store.UpsertMessageParams{
+		ChatJID:   chat,
+		MsgID:     "underived",
+		Timestamp: now,
+	}); err != nil {
+		t.Fatalf("underived insert: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	flags := &rootFlags{storeDir: storeDir, asJSON: true, readOnly: true, timeout: time.Minute}
+	raw := captureRootStdout(t, func() {
+		cmd := newChangesListCmd(flags)
+		cmd.SetArgs([]string{"--after-seq", "0", "--limit", "10"})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("changes list: %v", err)
+		}
+	})
+	var envelope struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Changes []struct {
+				Message map[string]json.RawMessage `json:"message"`
+			} `json:"changes"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !envelope.Success || len(envelope.Data.Changes) != 2 {
+		t.Fatalf("changes response success=%v count=%d, want true/2", envelope.Success, len(envelope.Data.Changes))
+	}
+	derived := envelope.Data.Changes[0].Message
+	if got := string(derived["MentionsMe"]); got != "true" {
+		t.Fatalf("derived MentionsMe JSON = %q, want true", got)
+	}
+	if got := string(derived["RepliesToMe"]); got != "false" {
+		t.Fatalf("derived RepliesToMe JSON = %q, want false", got)
+	}
+	underived := envelope.Data.Changes[1].Message
+	if _, ok := underived["MentionsMe"]; ok {
+		t.Fatal("underived message fabricated MentionsMe instead of omitting unknown tri-state")
+	}
+	if _, ok := underived["RepliesToMe"]; ok {
+		t.Fatal("underived message fabricated RepliesToMe instead of omitting unknown tri-state")
 	}
 }
 
@@ -131,4 +202,74 @@ func TestChangesCursorErrorUsesStandardJSONEnvelope(t *testing.T) {
 	if envelope.Success || envelope.Data != nil || envelope.Error == nil || *envelope.Error != "cursor_future" {
 		t.Fatalf("error envelope = %+v", envelope)
 	}
+}
+
+func TestChangesCLIReadOnlyRejectsUnmigratedLineages(t *testing.T) {
+	for _, lineage := range []string{"deployed-938", "old-927"} {
+		t.Run(lineage, func(t *testing.T) {
+			storeDir := createUnmigratedChangesStore(t, lineage)
+			var executeErr error
+			raw := captureRootStderr(t, func() {
+				executeErr = execute([]string{"--store", storeDir, "--read-only", "--json", "changes", "list", "--after-seq", "0"})
+			})
+			if !errors.Is(executeErr, store.ErrStoreNotMigrated) {
+				t.Fatalf("execute error = %v, want store_not_migrated", executeErr)
+			}
+			var envelope struct {
+				Success bool    `json:"success"`
+				Data    any     `json:"data"`
+				Error   *string `json:"error"`
+			}
+			if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
+				t.Fatalf("Unmarshal: %v\n%s", err, raw)
+			}
+			if envelope.Success || envelope.Data != nil || envelope.Error == nil || *envelope.Error != "store_not_migrated" {
+				t.Fatalf("error envelope = %+v", envelope)
+			}
+		})
+	}
+}
+
+func createUnmigratedChangesStore(t *testing.T, lineage string) string {
+	t.Helper()
+	storeDir := t.TempDir()
+	path := filepath.Join(storeDir, "wacli.db")
+	db, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer raw.Close()
+	var statements []string
+	switch lineage {
+	case "deployed-938":
+		statements = []string{
+			`ALTER TABLE messages DROP COLUMN mentions_me`,
+			`ALTER TABLE messages DROP COLUMN replies_to_me`,
+		}
+	case "old-927":
+		statements = []string{
+			`DROP TABLE message_changes`,
+			`DROP TABLE store_meta`,
+			`ALTER TABLE messages DROP COLUMN ingest_origin`,
+		}
+	default:
+		t.Fatalf("unknown lineage %q", lineage)
+	}
+	for _, statement := range statements {
+		if _, err := raw.Exec(statement); err != nil {
+			t.Fatalf("degrade %s store schema: %v", lineage, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw Close: %v", err)
+	}
+	return storeDir
 }

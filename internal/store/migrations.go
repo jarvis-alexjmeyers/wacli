@@ -36,6 +36,7 @@ var schemaMigrations = []migration{
 	{version: 19, name: "messages quoted columns", up: migrateMessagesQuotedColumns},
 	{version: 20, name: "messages media_unavailable_at column", up: migrateMessagesMediaUnavailableColumn},
 	{version: 21, name: "message changes", up: migrateMessageChanges},
+	{version: 22, name: "messages provider addressing columns", up: migrateMessagesProviderAddressingColumns},
 }
 
 func migrateMessageChanges(d *DB) error {
@@ -121,6 +122,35 @@ func newStoreInstanceID() (string, error) {
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
+// migrateMessagesProviderAddressingColumns adds the AITOOLS-927 tri-state columns.
+//
+// NULLABLE, and deliberately WITHOUT a default. Every row that already exists — the entire deployed
+// v0.11.2 store — becomes NULL = "we never derived this", which is the truth. A `NOT NULL DEFAULT 0`
+// would instead assert "this message did not mention you" about millions of rows we never examined,
+// turning an unknown into an authoritative false: the exact silent drop this ticket exists to fix.
+func migrateMessagesProviderAddressingColumns(d *DB) error {
+	hasTable, err := d.tableExists("messages")
+	if err != nil {
+		return err
+	}
+	if !hasTable {
+		return nil
+	}
+	for _, col := range []string{"mentions_me", "replies_to_me"} {
+		has, err := d.tableHasColumn("messages", col)
+		if err != nil {
+			return err
+		}
+		if has {
+			continue // idempotent: an interrupted migration re-runs safely
+		}
+		if _, err := d.sql.Exec(`ALTER TABLE messages ADD COLUMN ` + col + ` INTEGER`); err != nil {
+			return fmt.Errorf("add messages.%s column: %w", col, err)
+		}
+	}
+	return nil
 }
 
 func migrateMessagesMediaUnavailableColumn(d *DB) error {
@@ -219,6 +249,9 @@ func (d *DB) ensureCurrentSchema() error {
 	}
 	if err := migrateMessageChanges(d); err != nil {
 		return fmt.Errorf("ensure current message changes schema: %w", err)
+	}
+	if err := migrateMessagesProviderAddressingColumns(d); err != nil {
+		return fmt.Errorf("ensure current provider addressing columns: %w", err)
 	}
 	return nil
 }

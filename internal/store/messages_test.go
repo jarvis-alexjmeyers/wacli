@@ -15,6 +15,8 @@ func TestMessageUpsertIdempotentAndContext(t *testing.T) {
 	}
 
 	base := time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC)
+	mentionsMe := true
+	repliesToMe := false
 	msgs := []struct {
 		id   string
 		ts   time.Time
@@ -26,14 +28,16 @@ func TestMessageUpsertIdempotentAndContext(t *testing.T) {
 	}
 	for _, m := range msgs {
 		if err := db.UpsertMessage(UpsertMessageParams{
-			ChatJID:    chat,
-			ChatName:   "Alice",
-			MsgID:      m.id,
-			SenderJID:  chat,
-			SenderName: "Alice",
-			Timestamp:  m.ts,
-			FromMe:     false,
-			Text:       m.text,
+			ChatJID:     chat,
+			ChatName:    "Alice",
+			MsgID:       m.id,
+			SenderJID:   chat,
+			SenderName:  "Alice",
+			Timestamp:   m.ts,
+			FromMe:      false,
+			Text:        m.text,
+			MentionsMe:  &mentionsMe,
+			RepliesToMe: &repliesToMe,
 		}); err != nil {
 			t.Fatalf("UpsertMessage %s: %v", m.id, err)
 		}
@@ -41,14 +45,16 @@ func TestMessageUpsertIdempotentAndContext(t *testing.T) {
 
 	// Upsert same message again should not create duplicates.
 	if err := db.UpsertMessage(UpsertMessageParams{
-		ChatJID:    chat,
-		ChatName:   "Alice",
-		MsgID:      "m2",
-		SenderJID:  chat,
-		SenderName: "Alice",
-		Timestamp:  base.Add(2 * time.Second),
-		FromMe:     false,
-		Text:       "second",
+		ChatJID:     chat,
+		ChatName:    "Alice",
+		MsgID:       "m2",
+		SenderJID:   chat,
+		SenderName:  "Alice",
+		Timestamp:   base.Add(2 * time.Second),
+		FromMe:      false,
+		Text:        "second",
+		MentionsMe:  &mentionsMe,
+		RepliesToMe: &repliesToMe,
 	}); err != nil {
 		t.Fatalf("UpsertMessage again: %v", err)
 	}
@@ -65,6 +71,11 @@ func TestMessageUpsertIdempotentAndContext(t *testing.T) {
 	}
 	if ctx[0].MsgID != "m1" || ctx[1].MsgID != "m2" || ctx[2].MsgID != "m3" {
 		t.Fatalf("unexpected context order: %v, %v, %v", ctx[0].MsgID, ctx[1].MsgID, ctx[2].MsgID)
+	}
+	for _, message := range ctx {
+		if message.MentionsMe == nil || !*message.MentionsMe || message.RepliesToMe == nil || *message.RepliesToMe {
+			t.Fatalf("context addressing for %s = MentionsMe:%s RepliesToMe:%s, want true/false", message.MsgID, tri(message.MentionsMe), tri(message.RepliesToMe))
+		}
 	}
 }
 
@@ -362,6 +373,8 @@ func TestGetMessageReturnsRichDetails(t *testing.T) {
 	if err := db.UpsertChat(chat, "dm", "Alice", base); err != nil {
 		t.Fatalf("UpsertChat: %v", err)
 	}
+	mentionsMe := true
+	repliesToMe := false
 	if err := db.UpsertMessage(UpsertMessageParams{
 		ChatJID:       chat,
 		ChatName:      "Alice",
@@ -382,6 +395,8 @@ func TestGetMessageReturnsRichDetails(t *testing.T) {
 		FileSHA256:    []byte{4, 5},
 		FileEncSHA256: []byte{6, 7},
 		FileLength:    123,
+		MentionsMe:    &mentionsMe,
+		RepliesToMe:   &repliesToMe,
 	}); err != nil {
 		t.Fatalf("UpsertMessage: %v", err)
 	}
@@ -418,6 +433,9 @@ func TestGetMessageReturnsRichDetails(t *testing.T) {
 	}
 	if !msg.Starred || !msg.StarredAt.Equal(starredAt) {
 		t.Fatalf("unexpected starred fields: %+v", msg)
+	}
+	if msg.MentionsMe == nil || !*msg.MentionsMe || msg.RepliesToMe == nil || *msg.RepliesToMe {
+		t.Fatalf("unexpected addressing fields: MentionsMe:%s RepliesToMe:%s", tri(msg.MentionsMe), tri(msg.RepliesToMe))
 	}
 }
 

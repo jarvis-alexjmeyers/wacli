@@ -513,6 +513,8 @@ func (a *App) storeParsedMessageWithOrigin(ctx context.Context, pm wa.ParsedMess
 		displayText = store.DeletedMessageDisplayText
 	}
 
+	mentionsMe, repliesToMe := a.deriveProviderAddressing(chatJID, pm)
+
 	if err := a.db.UpsertMessage(store.UpsertMessageParams{
 		ChatJID:         chatJID,
 		ChatName:        chatName,
@@ -542,6 +544,8 @@ func (a *App) storeParsedMessageWithOrigin(ctx context.Context, pm wa.ParsedMess
 		Edited:          pm.Edited,
 		Revoked:         pm.Revoked,
 		Origin:          origin,
+		MentionsMe:      mentionsMe,
+		RepliesToMe:     repliesToMe,
 	}); err != nil {
 		return err
 	}
@@ -795,4 +799,38 @@ func mediaLabel(mediaType string) string {
 	default:
 		return mt
 	}
+}
+
+// deriveProviderAddressing answers "does this message address us?" and "is it a reply to something we
+// wrote?" (AITOOLS-927). Both are TRI-STATE: nil = we could not resolve it, which must never be
+// persisted as false.
+//
+// Identity comes from the LOGGED-IN SESSION (LinkedJID/LinkedLID), so every account — staging,
+// production, a private node — resolves its own. Nothing is hardcoded to one number.
+func (a *App) deriveProviderAddressing(chatJID string, pm wa.ParsedMessage) (*bool, *bool) {
+	if pm.Context == nil {
+		return nil, nil // no ContextInfo: nothing was derived, so claim nothing
+	}
+	self := wa.SelfIdentity{PN: a.wa.LinkedJID(), LID: a.wa.LinkedLID()}
+
+	mentionsMe := wa.DeriveMentionsMe(pm.Context, self, pm.IsForwarded)
+
+	// The reply claim requires LOCAL proof: ContextInfo.participant merely ASSERTS that we authored
+	// the quoted message, and an attacker controls it. Absence of a record is not a denial and is not
+	// a confirmation — it is unresolved.
+	proof := wa.ReplyProofAbsent
+	if pm.ReplyToID != "" {
+		found, fromMe, err := a.db.MessageAuthorship(chatJID, pm.ReplyToID)
+		switch {
+		case err != nil:
+			// A store error is NOT evidence of absence. Stay unresolved rather than inventing a false.
+			proof = wa.ReplyProofAbsent
+		case found && fromMe:
+			proof = wa.ReplyProofAuthoredByUs
+		case found:
+			proof = wa.ReplyProofAuthoredByOther
+		}
+	}
+	repliesToMe := wa.DeriveRepliesToMe(pm.Context, self, pm.IsForwarded, proof)
+	return mentionsMe, repliesToMe
 }

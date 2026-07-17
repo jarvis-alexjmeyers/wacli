@@ -26,6 +26,8 @@ func (d *DB) HistoricalLIDJIDs() ([]string, error) {
 		SELECT chat_jid FROM poll_votes WHERE chat_jid GLOB '*@lid'
 		UNION
 		SELECT voter_jid FROM poll_votes WHERE voter_jid GLOB '*@lid'
+		UNION
+		SELECT chat_jid FROM message_changes WHERE chat_jid GLOB '*@lid'
 		ORDER BY 1
 	`)
 	if err != nil {
@@ -75,6 +77,9 @@ func (d *DB) MigrateLIDToPN(lidJID, pnJID string) error {
 		return err
 	}
 	if err := migrateLIDMessagesToPN(tx, lidJID, pnJID); err != nil {
+		return err
+	}
+	if err := migrateLIDMessageChangesToPN(tx, lidJID, pnJID); err != nil {
 		return err
 	}
 	if err := migrateLIDSenderToPN(tx, lidJID, pnJID); err != nil {
@@ -166,7 +171,7 @@ func migrateLIDMessagesToPN(tx *sql.Tx, lidJID, pnJID string) error {
 	if _, err := tx.Exec(`
 		INSERT INTO messages(
 			chat_jid, chat_name, msg_id, sender_jid, sender_name, ts, from_me, text, display_text,
-			quoted_msg_id, quoted_sender_jid,
+			quoted_msg_id, quoted_sender_jid, mentions_me, replies_to_me,
 			is_forwarded, forwarding_score, reaction_to_id, reaction_emoji,
 			media_type, media_caption, filename, mime_type, direct_path,
 			media_key, file_sha256, file_enc_sha256, file_length, local_path, downloaded_at,
@@ -184,6 +189,8 @@ func migrateLIDMessagesToPN(tx *sql.Tx, lidJID, pnJID string) error {
 			display_text,
 			CASE WHEN revoked != 0 OR deleted_for_me != 0 THEN NULL ELSE quoted_msg_id END,
 			CASE WHEN revoked != 0 OR deleted_for_me != 0 THEN NULL WHEN quoted_sender_jid = ? THEN ? ELSE quoted_sender_jid END,
+			CASE WHEN revoked != 0 OR deleted_for_me != 0 THEN NULL ELSE mentions_me END,
+			CASE WHEN revoked != 0 OR deleted_for_me != 0 THEN NULL ELSE replies_to_me END,
 			is_forwarded,
 			forwarding_score,
 			reaction_to_id,
@@ -216,6 +223,8 @@ func migrateLIDMessagesToPN(tx *sql.Tx, lidJID, pnJID string) error {
 			display_text = CASE WHEN messages.deleted_for_me != 0 OR excluded.deleted_for_me != 0 THEN ? WHEN messages.revoked != 0 OR excluded.revoked != 0 THEN ? WHEN excluded.edited != 0 AND (messages.edited = 0 OR excluded.edited_ts > messages.edited_ts) THEN excluded.display_text WHEN messages.edited != 0 AND excluded.edited = 0 THEN messages.display_text ELSE COALESCE(NULLIF(messages.display_text, ''), excluded.display_text) END,
 			quoted_msg_id = CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL ELSE COALESCE(NULLIF(messages.quoted_msg_id, ''), excluded.quoted_msg_id) END,
 			quoted_sender_jid = CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL ELSE COALESCE(NULLIF(messages.quoted_sender_jid, ''), excluded.quoted_sender_jid) END,
+			mentions_me = CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN messages.mentions_me IS NULL THEN excluded.mentions_me WHEN excluded.mentions_me IS NULL THEN messages.mentions_me WHEN excluded.edited != 0 AND messages.edited = 0 THEN excluded.mentions_me WHEN messages.edited != 0 AND excluded.edited = 0 THEN messages.mentions_me WHEN excluded.edited != 0 AND messages.edited != 0 AND excluded.edited_ts > messages.edited_ts THEN excluded.mentions_me WHEN messages.edited != 0 AND excluded.edited != 0 THEN messages.mentions_me WHEN excluded.ts > messages.ts THEN excluded.mentions_me ELSE messages.mentions_me END,
+			replies_to_me = CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN messages.replies_to_me IS NULL THEN excluded.replies_to_me WHEN excluded.replies_to_me IS NULL THEN messages.replies_to_me WHEN excluded.edited != 0 AND messages.edited = 0 THEN excluded.replies_to_me WHEN messages.edited != 0 AND excluded.edited = 0 THEN messages.replies_to_me WHEN excluded.edited != 0 AND messages.edited != 0 AND excluded.edited_ts > messages.edited_ts THEN excluded.replies_to_me WHEN messages.edited != 0 AND excluded.edited != 0 THEN messages.replies_to_me WHEN excluded.ts > messages.ts THEN excluded.replies_to_me ELSE messages.replies_to_me END,
 			is_forwarded = CASE WHEN messages.is_forwarded != 0 THEN messages.is_forwarded ELSE excluded.is_forwarded END,
 			forwarding_score = max(messages.forwarding_score, excluded.forwarding_score),
 			reaction_to_id = COALESCE(NULLIF(messages.reaction_to_id, ''), excluded.reaction_to_id),
@@ -242,6 +251,13 @@ func migrateLIDMessagesToPN(tx *sql.Tx, lidJID, pnJID string) error {
 
 	if _, err := tx.Exec(`DELETE FROM messages WHERE chat_jid = ?`, lidJID); err != nil {
 		return fmt.Errorf("delete migrated lid messages: %w", err)
+	}
+	return nil
+}
+
+func migrateLIDMessageChangesToPN(tx *sql.Tx, lidJID, pnJID string) error {
+	if _, err := tx.Exec(`UPDATE message_changes SET chat_jid = ? WHERE chat_jid = ?`, pnJID, lidJID); err != nil {
+		return fmt.Errorf("rewrite lid message changes: %w", err)
 	}
 	return nil
 }
