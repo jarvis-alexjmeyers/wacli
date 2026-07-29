@@ -144,6 +144,13 @@ func newGroupsParticipantsListCmd(flags *rootFlags) *cobra.Command {
 			fmt.Fprintf(os.Stdout, "Group: %s\nJID: %s\nParticipants: %d\nCached as of: %s\n",
 				sanitize(name), info.JID, len(info.Participants), info.ParticipantsUpdatedAt,
 			)
+			// Say the departure out loud. Leaving does not clear the member
+			// rows, so without this the table renders a clean, current-looking
+			// roster for a group this account is no longer in — and only a
+			// --json caller could tell.
+			if info.LeftAt != "" {
+				fmt.Fprintf(os.Stdout, "LEFT THIS GROUP: %s (membership below is stale)\n", info.LeftAt)
+			}
 			w := newTableWriter(os.Stdout)
 			fmt.Fprintln(w, "JID\tROLE")
 			for _, p := range info.Participants {
