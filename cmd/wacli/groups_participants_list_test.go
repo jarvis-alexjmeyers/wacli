@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/openclaw/wacli/internal/store"
+	"go.mau.fi/whatsmeow/types"
 )
 
 // The whole point of `groups participants list` is that it answers while a
@@ -162,5 +164,74 @@ func TestGroupsParticipantsListDoesNotCreateAStore(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(storeDir, "wacli.db")); err == nil {
 		t.Fatal("the command created a store database")
+	}
+}
+
+// --- LID resolution -------------------------------------------------------
+//
+// The sync path stores whatever JID the provider used, and for a modern
+// WhatsApp group that is a privacy LID. A LID matches nothing in a contact
+// directory, so emitting it raw makes every member unresolvable — which is what
+// production did: 9 of 9 members stored as LIDs, every one showing "no contact
+// linked". These pin the split.
+
+type stubResolver struct{ m map[string]string }
+
+func (s stubResolver) ResolveLIDToPN(_ context.Context, jid types.JID) types.JID {
+	if pn, ok := s.m[jid.User]; ok {
+		return types.JID{User: pn, Server: types.DefaultUserServer}
+	}
+	return jid
+}
+
+func TestResolveParticipantJIDSplitsLidFromPhone(t *testing.T) {
+	r := stubResolver{m: map[string]string{"999123456789": "15550000001"}}
+
+	// A stored phone number passes through as the JID, with no LID.
+	jid, lid := resolveParticipantJID(context.Background(), r, "15550000002@s.whatsapp.net")
+	if jid != "15550000002@s.whatsapp.net" || lid != "" {
+		t.Fatalf("phone passthrough: jid=%q lid=%q", jid, lid)
+	}
+
+	// A resolvable LID yields the PHONE as the JID and keeps the LID beside it.
+	jid, lid = resolveParticipantJID(context.Background(), r, "999123456789@lid")
+	if jid != "15550000001@s.whatsapp.net" {
+		t.Fatalf("resolvable lid should yield the phone jid, got %q", jid)
+	}
+	if lid != "999123456789@lid" {
+		t.Fatalf("the original lid must be preserved, got %q", lid)
+	}
+}
+
+// The bug this whole change exists to prevent: an UNRESOLVABLE lid must never
+// be emitted as the JID. A consumer that prefers JID would then hold something
+// it believes is a phone number, match nothing, and report a member it cannot
+// name — silently.
+func TestAnUnresolvableLidIsNeverEmittedAsAPhoneJID(t *testing.T) {
+	r := stubResolver{m: map[string]string{}}
+
+	jid, lid := resolveParticipantJID(context.Background(), r, "999999999999@lid")
+	if jid != "" {
+		t.Fatalf("an unresolvable lid must not become the JID, got %q", jid)
+	}
+	if lid != "999999999999@lid" {
+		t.Fatalf("the lid must still be reported, got %q", lid)
+	}
+
+	// Same rule with no resolver at all (no session.db / open failure):
+	// degrade to LID-only, never fail the read and never fake a phone jid.
+	jid, lid = resolveParticipantJID(context.Background(), nil, "999999999999@lid")
+	if jid != "" || lid != "999999999999@lid" {
+		t.Fatalf("nil resolver: jid=%q lid=%q", jid, lid)
+	}
+}
+
+// A resolver that hands back another LID (whatsmeow returns the input unchanged
+// when it has no mapping) must be treated as unresolved, not as a phone number.
+func TestALidResolvingToALidIsStillUnresolved(t *testing.T) {
+	r := stubResolver{m: map[string]string{}}
+	jid, lid := resolveParticipantJID(context.Background(), r, "888888888888@lid")
+	if jid != "" || lid != "888888888888@lid" {
+		t.Fatalf("lid->lid must stay unresolved: jid=%q lid=%q", jid, lid)
 	}
 }

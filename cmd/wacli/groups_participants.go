@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/openclaw/wacli/internal/app"
 	"github.com/openclaw/wacli/internal/out"
+	"github.com/openclaw/wacli/internal/store"
 	"github.com/openclaw/wacli/internal/wa"
 	"github.com/spf13/cobra"
 	"go.mau.fi/whatsmeow/types"
@@ -30,7 +33,15 @@ func newGroupsParticipantsCmd(flags *rootFlags) *cobra.Command {
 // that a local row can honestly fill. The JSON names match `groups info` exactly
 // so a consumer can parse either without branching.
 type localGroupParticipant struct {
-	JID       string `json:"JID"`
+	// JID is the PHONE jid, the only form that carries a phone number and so
+	// the only form a contact directory can match on. Omitted when the stored
+	// row is a privacy LID that cannot be resolved to one.
+	JID string `json:"JID,omitempty"`
+	// LID is the privacy identifier, present when that is what the store held.
+	// whatsmeow's own GroupParticipant carries both side by side; emitting the
+	// same shape means a consumer that prefers JID and falls back to LID needs
+	// no special case for the local read.
+	LID       string `json:"LID,omitempty"`
 	IsAdmin   bool   `json:"IsAdmin"`
 	Role      string `json:"Role"`
 	UpdatedAt string `json:"UpdatedAt"`
@@ -56,6 +67,61 @@ type localGroupInfo struct {
 	// resurrected membership for a group you are not in and have no way to
 	// tell. Empty means still a member.
 	LeftAt string `json:"LeftAt"`
+}
+
+// participantResolver returns a LID resolver only when one is needed and
+// available. Mirrors `resolveStoredChats`: skip entirely when no participant is
+// a LID, and degrade to nil (no resolution) rather than failing the read — a
+// roster with unresolved identities is worth far more than no roster.
+// lidResolver is the NARROW slice of the app resolver this file needs — the
+// same shape `chats.go` uses for its own display resolution. Taking the wide
+// interface would make every test stub implement methods it never calls.
+type lidResolver interface {
+	ResolveLIDToPN(ctx context.Context, jid types.JID) types.JID
+}
+
+func participantResolver(ctx context.Context, a *app.App, ps []store.GroupParticipant) lidResolver {
+	needed := false
+	for _, p := range ps {
+		if strings.HasSuffix(strings.TrimSpace(p.UserJID), "@"+types.HiddenUserServer) {
+			needed = true
+			break
+		}
+	}
+	if !needed {
+		return nil
+	}
+	if _, err := os.Stat(filepath.Join(a.StoreDir(), "session.db")); err != nil {
+		return nil
+	}
+	resolver, err := a.LocalResolver()
+	if err != nil {
+		return nil
+	}
+	return resolver
+}
+
+// resolveParticipantJID splits a stored identity into (phone JID, LID).
+//
+// A stored phone number returns as the JID with no LID. A stored LID returns
+// its phone number as the JID and itself as the LID when the map knows it, and
+// LID-only when it does not — never the LID masquerading as a JID, because a
+// consumer preferring "JID" would then match nothing while believing it had a
+// phone number.
+func resolveParticipantJID(ctx context.Context, resolver lidResolver, stored string) (string, string) {
+	trimmed := strings.TrimSpace(stored)
+	jid, err := types.ParseJID(trimmed)
+	if err != nil || jid.Server != types.HiddenUserServer {
+		return trimmed, ""
+	}
+	if resolver == nil {
+		return "", trimmed
+	}
+	resolved := resolver.ResolveLIDToPN(ctx, jid)
+	if resolved.IsEmpty() || resolved.Server == types.HiddenUserServer {
+		return "", trimmed
+	}
+	return resolved.String(), trimmed
 }
 
 func newGroupsParticipantsListCmd(flags *rootFlags) *cobra.Command {
@@ -119,17 +185,26 @@ func newGroupsParticipantsListCmd(flags *rootFlags) *cobra.Command {
 				ParticipantsCachedOnly: true,
 				LeftAt:                 formatLocalTS(group.LeftAt),
 			}
+			// The sync path stores whatever JID the provider used, and for a
+			// modern WhatsApp group that is very often a privacy LID rather
+			// than a phone number. A LID matches nothing in a contact
+			// directory, so emitting it raw makes every member unresolvable —
+			// which is exactly what happened in production. Resolve through the
+			// existing READ-ONLY session map (same helper `chats` already uses)
+			// and report the phone JID when one exists.
+			resolver := participantResolver(ctx, a, ps)
 			var freshest time.Time
 			for _, p := range ps {
 				if p.UpdatedAt.After(freshest) {
 					freshest = p.UpdatedAt
 				}
-				info.Participants = append(info.Participants, localGroupParticipant{
-					JID:       p.UserJID,
+				entry := localGroupParticipant{
 					IsAdmin:   p.Role == "admin" || p.Role == "superadmin",
 					Role:      p.Role,
 					UpdatedAt: formatLocalTS(p.UpdatedAt),
-				})
+				}
+				entry.JID, entry.LID = resolveParticipantJID(ctx, resolver, p.UserJID)
+				info.Participants = append(info.Participants, entry)
 			}
 			info.ParticipantsUpdatedAt = formatLocalTS(freshest)
 
