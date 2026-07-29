@@ -147,6 +147,74 @@ func (d *DB) ListGroups(query string, limit int) ([]Group, error) {
 	return out, rows.Err()
 }
 
+// GetGroup returns one group by exact JID, or (nil, nil) when it is not stored.
+//
+// Deliberately an EXACT lookup, not ListGroups with a query: ListGroups matches
+// with LIKE, so a JID is a substring pattern there and two groups can share a
+// numeric stem. It also does not filter on left_at — a group you have left is
+// still a group you may need to name.
+func (d *DB) GetGroup(jid string) (*Group, error) {
+	jid = strings.TrimSpace(jid)
+	if jid == "" {
+		return nil, fmt.Errorf("group JID is required")
+	}
+	const q = `SELECT jid, COALESCE(name,''), COALESCE(owner_jid,''), is_parent, COALESCE(linked_parent_jid,''), COALESCE(created_ts,0), COALESCE(left_at,0), updated_at FROM groups WHERE jid = ?`
+	var g Group
+	var isParent int
+	var created, left, updated int64
+	err := d.sql.QueryRow(q, jid).Scan(
+		&g.JID, &g.Name, &g.OwnerJID, &isParent, &g.LinkedParentJID, &created, &left, &updated,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	g.IsParent = isParent != 0
+	g.CreatedAt = fromUnix(created)
+	g.LeftAt = fromUnix(left)
+	g.UpdatedAt = fromUnix(updated)
+	return &g, nil
+}
+
+// ListGroupParticipants returns a group's stored members, oldest-updated first.
+//
+// This is a LOCAL read and takes no store lock, so it answers while a long-lived
+// `sync --follow` holds the write lock — which is the whole point: `groups info`
+// is the only command that reports participants and it cannot run under a
+// follower, so a machine that actually receives WhatsApp could never read its
+// own group membership. The sync path already writes this table on every group
+// message it handles (see ReplaceGroupParticipants), so the data is present.
+//
+// The rows are the local cache, not a live fetch, and are exactly as fresh as
+// the last group message the follower processed. The caller decides whether
+// that is fresh enough; UpdatedAt is returned so it can.
+func (d *DB) ListGroupParticipants(groupJID string) ([]GroupParticipant, error) {
+	groupJID = strings.TrimSpace(groupJID)
+	if groupJID == "" {
+		return nil, fmt.Errorf("group JID is required")
+	}
+	const q = `SELECT group_jid, user_jid, COALESCE(role,''), updated_at FROM group_participants WHERE group_jid = ? ORDER BY user_jid`
+	rows, err := d.sql.Query(q, groupJID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []GroupParticipant
+	for rows.Next() {
+		var p GroupParticipant
+		var updated int64
+		if err := rows.Scan(&p.GroupJID, &p.UserJID, &p.Role, &updated); err != nil {
+			return nil, err
+		}
+		p.UpdatedAt = fromUnix(updated)
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 func (d *DB) DeleteGroup(jid string) error {
 	jid = strings.TrimSpace(jid)
 	if jid == "" {
