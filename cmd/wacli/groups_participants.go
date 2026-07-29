@@ -51,6 +51,11 @@ type localGroupInfo struct {
 	FromLocalStore         bool                    `json:"FromLocalStore"`
 	ParticipantsUpdatedAt  string                  `json:"ParticipantsUpdatedAt"`
 	ParticipantsCachedOnly bool                    `json:"ParticipantsCachedOnly"`
+	// LeftAt is set when this account is no longer in the group. Leaving does
+	// NOT clear group_participants, so without this a caller would read a
+	// resurrected membership for a group you are not in and have no way to
+	// tell. Empty means still a member.
+	LeftAt string `json:"LeftAt"`
 }
 
 func newGroupsParticipantsListCmd(flags *rootFlags) *cobra.Command {
@@ -67,11 +72,19 @@ func newGroupsParticipantsListCmd(flags *rootFlags) *cobra.Command {
 			if strings.TrimSpace(jidStr) == "" {
 				return fmt.Errorf("--jid is required")
 			}
-			// No requireWritable() and no lock: this reads and never writes.
+			// newReadOnlyApp, NOT newApp(needLock=false). Skipping the flock
+			// is not enough: a read-WRITE open runs ensureSchema() DDL and a
+			// store_meta seed on every invocation, which contends for the WAL
+			// writer the sync --follow daemon holds — so under a concurrent
+			// write this command fails "database is locked" despite taking no
+			// lock of its own. It would also CREATE a store from nothing if the
+			// resolved path were wrong. newReadOnlyApp's own doc comment names
+			// this exact case: a command polled by an edge consumer beside the
+			// follower.
 			ctx, cancel := withTimeout(context.Background(), flags)
 			defer cancel()
 
-			a, lk, err := newApp(ctx, flags, false, false)
+			a, lk, err := newReadOnlyApp(ctx, flags, false)
 			if err != nil {
 				return err
 			}
@@ -104,6 +117,7 @@ func newGroupsParticipantsListCmd(flags *rootFlags) *cobra.Command {
 				Participants:           make([]localGroupParticipant, 0, len(ps)),
 				FromLocalStore:         true,
 				ParticipantsCachedOnly: true,
+				LeftAt:                 formatLocalTS(group.LeftAt),
 			}
 			var freshest time.Time
 			for _, p := range ps {

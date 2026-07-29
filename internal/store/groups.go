@@ -178,7 +178,7 @@ func (d *DB) GetGroup(jid string) (*Group, error) {
 	return &g, nil
 }
 
-// ListGroupParticipants returns a group's stored members, oldest-updated first.
+// ListGroupParticipants returns a group's stored members, ordered by user JID.
 //
 // This is a LOCAL read and takes no store lock, so it answers while a long-lived
 // `sync --follow` holds the write lock — which is the whole point: `groups info`
