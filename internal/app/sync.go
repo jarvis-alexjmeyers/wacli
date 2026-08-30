@@ -77,7 +77,8 @@ type SyncOptions struct {
 	WebhookURL          string
 	WebhookSecret       string
 	WebhookAllowPrivate bool
-	Verbosity           int // future
+	WebhookEvents       SyncWebhookEventSet // nil = messages only
+	Verbosity           int                 // future
 }
 
 type SyncResult struct {
@@ -139,6 +140,7 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 	lastEvent.Store(now)
 
 	disconnected := make(chan struct{}, 1)
+	loggedOut := make(chan struct{}, 1)
 	staleReconnect := make(chan staleReconnectRequest, 1)
 
 	var waitMedia func(context.Context) bool
@@ -162,17 +164,17 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 	}
 
 	var stopWebhook func()
-	var webhookJobs chan wa.ParsedMessage
-	enqueueWebhook := func(wa.ParsedMessage) {}
+	var webhookJobs chan syncWebhookEvent
+	enqueueWebhook := func(syncWebhookEvent) {}
 	if syncWebhookEnabled(opts) {
-		webhookJobs = make(chan wa.ParsedMessage, 512)
+		webhookJobs = make(chan syncWebhookEvent, 512)
 		enqueueWebhook = a.newSyncWebhookEnqueuer(syncCtx, webhookJobs)
 		stopWebhook = a.runSyncWebhookWorker(syncCtx, opts, webhookJobs)
 		defer stopWebhook()
 	}
 
 	ps := &syncPresence{}
-	handlerID := a.addSyncEventHandler(syncCtx, opts, &messagesStored, &lastEvent, disconnected, staleReconnect, enqueueMedia, enqueueWebhook, limits, ps, mediaQ)
+	handlerID := a.addSyncEventHandler(syncCtx, opts, &messagesStored, &lastEvent, disconnected, loggedOut, staleReconnect, enqueueMedia, enqueueWebhook, limits, ps, mediaQ)
 	defer a.wa.RemoveEventHandler(handlerID)
 
 	connectionEpoch.Store(nowUTC().UnixNano())
@@ -233,9 +235,9 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 
 	var err error
 	if opts.Mode == SyncModeFollow {
-		_, err = a.runSyncFollow(syncCtx, opts.MaxReconnect, opts.PresenceMode, &messagesStored, &connectionEpoch, disconnected, staleReconnect)
+		_, err = a.runSyncFollow(syncCtx, opts.MaxReconnect, opts.PresenceMode, &messagesStored, &connectionEpoch, disconnected, loggedOut, staleReconnect)
 	} else {
-		_, err = a.runSyncUntilIdle(syncCtx, opts.IdleExit, opts.MaxReconnect, opts.PresenceMode, &messagesStored, &lastEvent, disconnected)
+		_, err = a.runSyncUntilIdle(syncCtx, opts.IdleExit, opts.MaxReconnect, opts.PresenceMode, &messagesStored, &lastEvent, disconnected, loggedOut)
 	}
 	limitErr := limits.Err()
 	// Successful one-shot modes must finish queued downloads before cleanup
@@ -454,7 +456,8 @@ func (a *App) storeParsedMessageWithOrigin(ctx context.Context, pm wa.ParsedMess
 	// Best-effort: store group metadata (and participants) when available.
 	if pm.Chat.Server == types.GroupServer {
 		if gi, err := a.wa.GetGroupInfo(ctx, pm.Chat); err == nil && gi != nil {
-			_ = a.db.UpsertGroupWithHierarchy(gi.JID.String(), gi.GroupName.Name, gi.OwnerJID.String(), gi.GroupCreated, gi.IsParent, gi.LinkedParentJID.String())
+			ownerJID := a.canonicalStoreJID(ctx, gi.OwnerJID).String()
+			_ = a.db.UpsertGroupWithHierarchy(gi.JID.String(), gi.GroupName.Name, ownerJID, gi.GroupCreated, gi.IsParent, gi.LinkedParentJID.String())
 			var ps []store.GroupParticipant
 			for _, p := range gi.Participants {
 				role := "member"
@@ -465,7 +468,7 @@ func (a *App) storeParsedMessageWithOrigin(ctx context.Context, pm wa.ParsedMess
 				}
 				ps = append(ps, store.GroupParticipant{
 					GroupJID: pm.Chat.String(),
-					UserJID:  canonicalJIDString(p.JID),
+					UserJID:  a.canonicalStoreJID(ctx, p.JID).String(),
 					Role:     role,
 				})
 			}
@@ -526,7 +529,7 @@ func (a *App) storeParsedMessageWithOrigin(ctx context.Context, pm wa.ParsedMess
 		Text:            pm.Text,
 		DisplayText:     displayText,
 		QuotedMsgID:     pm.ReplyToID,
-		QuotedSenderJID: pm.ReplyToSenderJID,
+		QuotedSenderJID: a.canonicalStoreJIDString(ctx, pm.ReplyToSenderJID),
 		Buttons:         waButtonsToStore(pm.Buttons),
 		IsForwarded:     pm.IsForwarded,
 		ForwardingScore: pm.ForwardingScore,
@@ -548,6 +551,20 @@ func (a *App) storeParsedMessageWithOrigin(ctx context.Context, pm wa.ParsedMess
 		RepliesToMe:     repliesToMe,
 	}); err != nil {
 		return err
+	}
+	a.warnUnhandledPayload(pm)
+	if pm.Location != nil {
+		if err := a.db.UpsertMessageLocation(store.MessageLocation{
+			ChatJID:   chatJID,
+			MsgID:     pm.ID,
+			Latitude:  pm.Location.Latitude,
+			Longitude: pm.Location.Longitude,
+			Name:      pm.Location.Name,
+			Address:   pm.Location.Address,
+			IsLive:    pm.Location.IsLive,
+		}); err != nil {
+			return err
+		}
 	}
 	if pm.Call != nil {
 		pm.Call.Chat = pm.Chat
@@ -708,6 +725,32 @@ func (a *App) buildDisplayText(ctx context.Context, pm wa.ParsedMessage) string 
 	return base
 }
 
+// warnUnhandledPayload surfaces messages whose payload produced no content, so
+// the resulting "(message)" placeholder is diagnosable. Without it the row is
+// indistinguishable from a message that genuinely carried nothing, and any
+// consumer reading local history silently sees a gap it cannot account for.
+//
+// Called only after the message upsert succeeds: the warning states that the
+// row was stored, so emitting it earlier would report a write that may still
+// fail.
+func (a *App) warnUnhandledPayload(pm wa.ParsedMessage) {
+	if pm.UnhandledPayload == "" {
+		return
+	}
+	a.emitWarning(
+		"unhandled_message_payload",
+		fmt.Sprintf(
+			"stored message %s in %s without content: unhandled payload %s",
+			pm.ID, canonicalJIDString(pm.Chat), pm.UnhandledPayload,
+		),
+		map[string]any{
+			"chat_jid": canonicalJIDString(pm.Chat),
+			"msg_id":   pm.ID,
+			"payload":  pm.UnhandledPayload,
+		},
+	)
+}
+
 func baseDisplayText(pm wa.ParsedMessage) string {
 	if pm.Call != nil {
 		return callDisplayText(*pm.Call)
@@ -790,6 +833,8 @@ func mediaLabel(mediaType string) string {
 		return "document"
 	case "location":
 		return "location"
+	case "live_location":
+		return "live location"
 	case "contact":
 		return "contact"
 	case "contacts":

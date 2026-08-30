@@ -114,6 +114,9 @@ type Message struct {
 	MediaUnavailableAt sql.NullInt64
 	Revoked            int64
 	DeletedForMe       int64
+	DeletedAt          sql.NullInt64
+	DeletionReason     sql.NullString
+	PayloadPurgedAt    sql.NullInt64
 	Edited             int64
 	EditedTs           int64
 	Buttons            sql.NullString
@@ -129,6 +132,31 @@ type MessageChange struct {
 	Ts        int64
 	FromMe    int64
 	CreatedAt int64
+}
+
+type MessageLocalMediaAlias struct {
+	ChatJid      string
+	MsgID        string
+	LocalPath    string
+	DownloadedAt sql.NullInt64
+}
+
+type MessageLocation struct {
+	ChatJid   string
+	MsgID     string
+	Latitude  float64
+	Longitude float64
+	Name      sql.NullString
+	Address   sql.NullString
+	IsLive    int64
+}
+
+type MessagePayloadPurge struct {
+	ChatJid        string
+	MsgID          string
+	PurgedAt       int64
+	DeletedAt      int64
+	DeletionReason string
 }
 
 type MessagesFt struct {

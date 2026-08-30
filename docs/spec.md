@@ -110,6 +110,9 @@ Immediately after QR pairing success, `wacli auth` runs a bootstrap sync:
 - `status_messages`
   - `rowid` (PK), `msg_id` (unique), `ts`, `from_me`, `sender_jid`, `sender_name`, `text`, `media_type`, `media_caption`, `filename`, `mime_type`, `direct_path`, hashes/keys, `background_color`, `font`, …
   - status broadcasts use WhatsApp's `status@broadcast` target and are kept out of normal chat `messages`.
+- `message_locations`
+  - (`chat_jid`, `msg_id`) (PK), `latitude`, `longitude`, `name`, `address`, `is_live`
+  - one row per location pin; the message row keeps `media_type=location` (or `live_location`) and the coordinates live here rather than in `messages`.
 - `contact_aliases` (local management)
   - `jid` (PK/FK), `alias`, `notes`, `tags` (or join table)
 
@@ -175,7 +178,7 @@ combined with `--account`.
 
 ### Sync
 
-- `wacli sync [--once] [--follow] [--stale-threshold DURATION] [--download-media] [--webhook URL] [--webhook-secret SECRET]`
+- `wacli sync [--once] [--follow] [--stale-threshold DURATION] [--download-media] [--webhook URL] [--webhook-secret SECRET] [--webhook-events LIST]`
 
 Notes:
 
@@ -183,6 +186,7 @@ Notes:
 - `--download-media` runs a bounded/concurrent media downloader for messages that contain downloadable media metadata.
 - `--webhook` posts live message JSON after successful local storage on a bounded background worker.
 - `--webhook-secret` adds an HMAC-SHA256 `X-Wacli-Signature` header and requires `--webhook`.
+- `--webhook-events` selects which event types are posted (`message`, `receipt`, `chat_presence`; default `message`) and requires `--webhook`. Receipt and chat-presence payloads carry a flat `EventType` discriminator; legacy message payloads omit it.
 - Webhook failures and full-queue drops emit warnings but do not fail sync.
 
 ### History backfill (best-effort)
@@ -209,7 +213,7 @@ WhatsApp Web history is best-effort. If you want to try fetching *older* message
 ### Send
 
 - `wacli send text --to RECIPIENT --message TEXT [--message-escapes] [--pick N] [--no-preview] [--reply-to MSG_ID] [--reply-to-sender JID]`
-- `wacli send file --to RECIPIENT --file PATH [--caption TEXT] [--mime TYPE] [--pick N] [--ptt] [--reply-to MSG_ID] [--reply-to-sender JID]`
+- `wacli send file --to RECIPIENT --file PATH [--caption TEXT] [--mime TYPE] [--as auto|document|audio|image|video] [--pick N] [--ptt] [--reply-to MSG_ID] [--reply-to-sender JID]`
 - `wacli send sticker --to RECIPIENT --file PATH [--pick N] [--reply-to MSG_ID] [--reply-to-sender JID]`
 - `wacli send voice --to RECIPIENT --file PATH [--mime TYPE] [--pick N] [--reply-to MSG_ID] [--reply-to-sender JID]`
 - `wacli send react --to PHONE_OR_JID --id MSG_ID [--reaction TEXT] [--sender JID]`

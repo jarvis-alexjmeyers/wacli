@@ -91,6 +91,9 @@ CREATE TABLE IF NOT EXISTS messages (
     media_unavailable_at INTEGER,
     revoked INTEGER NOT NULL DEFAULT 0,
     deleted_for_me INTEGER NOT NULL DEFAULT 0,
+    deleted_at INTEGER,
+    deletion_reason TEXT,
+    payload_purged_at INTEGER,
     edited INTEGER NOT NULL DEFAULT 0,
     edited_ts INTEGER NOT NULL DEFAULT 0,
     buttons TEXT,
@@ -119,6 +122,24 @@ CREATE TABLE IF NOT EXISTS message_changes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_message_changes_created_at ON message_changes(created_at);
+
+CREATE TABLE IF NOT EXISTS message_payload_purges (
+    chat_jid TEXT NOT NULL,
+    msg_id TEXT NOT NULL,
+    purged_at INTEGER NOT NULL,
+    deleted_at INTEGER NOT NULL,
+    deletion_reason TEXT NOT NULL,
+    PRIMARY KEY (chat_jid, msg_id)
+);
+
+CREATE TABLE IF NOT EXISTS message_local_media_aliases (
+    chat_jid TEXT NOT NULL,
+    msg_id TEXT NOT NULL,
+    local_path TEXT NOT NULL,
+    downloaded_at INTEGER,
+    PRIMARY KEY (chat_jid, msg_id, local_path),
+    FOREIGN KEY (chat_jid, msg_id) REFERENCES messages(chat_jid, msg_id) ON DELETE CASCADE
+);
 
 CREATE TABLE IF NOT EXISTS status_messages (
     rowid INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -190,6 +211,17 @@ CREATE TABLE IF NOT EXISTS polls (
 );
 
 CREATE INDEX IF NOT EXISTS idx_polls_chat_ts ON polls(chat_jid, created_ts);
+
+CREATE TABLE IF NOT EXISTS message_locations (
+    chat_jid TEXT NOT NULL,
+    msg_id TEXT NOT NULL,
+    latitude REAL NOT NULL,
+    longitude REAL NOT NULL,
+    name TEXT,
+    address TEXT,
+    is_live INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (chat_jid, msg_id)
+);
 
 CREATE TABLE IF NOT EXISTS poll_votes (
     chat_jid TEXT NOT NULL,

@@ -38,11 +38,30 @@ func TestOpenCreatesExpectedSchema(t *testing.T) {
 		"media_unavailable_at",
 		"revoked",
 		"deleted_for_me",
+		"deleted_at",
+		"deletion_reason",
+		"payload_purged_at",
 		"edited",
 		"edited_ts",
 	} {
 		if !cols[want] {
 			t.Fatalf("expected messages column %q to exist", want)
+		}
+	}
+	if exists, err := db.tableExists("message_payload_purges"); err != nil || !exists {
+		t.Fatalf("message_payload_purges table exists = %v, err = %v", exists, err)
+	}
+	if exists, err := db.tableExists("message_local_media_aliases"); err != nil || !exists {
+		t.Fatalf("message_local_media_aliases table exists = %v, err = %v", exists, err)
+	}
+
+	locationCols, err := tableColumns(db.sql, "message_locations")
+	if err != nil {
+		t.Fatalf("message_locations tableColumns: %v", err)
+	}
+	for _, want := range []string{"chat_jid", "msg_id", "latitude", "longitude", "name", "address", "is_live"} {
+		if !locationCols[want] {
+			t.Fatalf("expected message_locations column %q to exist", want)
 		}
 	}
 
@@ -97,6 +116,16 @@ func TestOpenCreatesExpectedSchema(t *testing.T) {
 	if !chatCols["unread_count"] {
 		t.Fatalf("expected chats unread_count column to exist")
 	}
+	if exists, err := db.tableExists("app_state_recovery_required"); err != nil {
+		t.Fatalf("app_state_recovery_required tableExists: %v", err)
+	} else if exists {
+		t.Fatal("legacy app_state_recovery_required table still exists")
+	}
+	if exists, err := db.tableExists("app_state_recovery_intents"); err != nil {
+		t.Fatalf("app_state_recovery_intents tableExists: %v", err)
+	} else if !exists {
+		t.Fatal("expected app_state_recovery_intents table to exist")
+	}
 
 	statusCols, err := tableColumns(db.sql, "status_messages")
 	if err != nil {
@@ -112,154 +141,63 @@ func TestOpenCreatesExpectedSchema(t *testing.T) {
 	}
 }
 
-func TestFreshStoreRunsMigrationsThrough22AndMatchesEmbeddedMessageSchema(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "wacli.db")
-	db, err := Open(path)
-	if err != nil {
-		t.Fatalf("Open fresh: %v", err)
-	}
-	defer db.Close()
-
-	rows, err := db.sql.Query(`SELECT version, name FROM schema_migrations ORDER BY version`)
-	if err != nil {
-		t.Fatalf("read schema migrations: %v", err)
-	}
-	defer rows.Close()
-	for index, want := range schemaMigrations {
-		if !rows.Next() {
-			t.Fatalf("schema migrations stopped at %d, want migration %d", index, want.version)
-		}
-		var version int
-		var name string
-		if err := rows.Scan(&version, &name); err != nil {
-			t.Fatalf("scan schema migration: %v", err)
-		}
-		if version != want.version || name != want.name {
-			t.Fatalf("schema migration %d = (%d, %q), want (%d, %q)", index, version, name, want.version, want.name)
-		}
-	}
-	if rows.Next() {
-		t.Fatal("fresh store recorded an unexpected migration after 22")
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate schema migrations: %v", err)
-	}
-
-	reference, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "schema-reference.db"))
-	if err != nil {
-		t.Fatalf("open schema reference: %v", err)
-	}
-	defer reference.Close()
-	if _, err := reference.Exec(coreSchemaSQL); err != nil {
-		t.Fatalf("apply embedded schema: %v", err)
-	}
-	schemaRows, err := reference.Query(`
-		SELECT type, name, sql
-		FROM sqlite_schema
-		WHERE type IN ('table', 'index') AND sql IS NOT NULL
-		ORDER BY type, name
-	`)
-	if err != nil {
-		t.Fatalf("read embedded schema objects: %v", err)
-	}
-	for schemaRows.Next() {
-		var objectType string
-		var name string
-		var wantSQL string
-		if err := schemaRows.Scan(&objectType, &name, &wantSQL); err != nil {
-			_ = schemaRows.Close()
-			t.Fatalf("scan embedded schema object: %v", err)
-		}
-		var gotSQL string
-		if err := db.sql.QueryRow(`SELECT sql FROM sqlite_schema WHERE type = ? AND name = ?`, objectType, name).Scan(&gotSQL); err != nil {
-			_ = schemaRows.Close()
-			t.Fatalf("read fresh schema object %s %s: %v", objectType, name, err)
-		}
-		if gotSQL != wantSQL {
-			_ = schemaRows.Close()
-			t.Fatalf("fresh schema object %s %s does not match schema.sql", objectType, name)
-		}
-	}
-	if err := schemaRows.Err(); err != nil {
-		_ = schemaRows.Close()
-		t.Fatalf("iterate embedded schema objects: %v", err)
-	}
-	if err := schemaRows.Close(); err != nil {
-		t.Fatalf("close embedded schema objects: %v", err)
-	}
-	if got := countRows(t, db.sql, `
-		SELECT COUNT(*)
-		FROM pragma_table_info('messages')
-		WHERE name IN ('mentions_me', 'replies_to_me')
-		  AND "notnull" = 0
-		  AND dflt_value IS NULL
-	`); got != 2 {
-		t.Fatalf("nullable provider-addressing columns without defaults = %d, want 2", got)
-	}
-}
-
-func TestMigration22UpgradesMigration21StoreWithoutFabricatingFalse(t *testing.T) {
+func TestOpenMigratesLegacyMessageTombstonesWithoutPayloadLoss(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "wacli.db")
 	raw, err := sql.Open("sqlite3", path)
 	if err != nil {
-		t.Fatalf("sql.Open: %v", err)
+		t.Fatal(err)
 	}
-	migration21Schema := strings.Replace(coreSchemaSQL, "    mentions_me INTEGER,\n", "", 1)
-	migration21Schema = strings.Replace(migration21Schema, "    replies_to_me INTEGER,\n", "", 1)
-	if _, err := raw.Exec(migration21Schema + `
+	legacySchema := strings.Replace(coreSchemaSQL, "    deleted_at INTEGER,\n    deletion_reason TEXT,\n    payload_purged_at INTEGER,\n", "", 1)
+	legacySchema = strings.Replace(legacySchema, `CREATE TABLE IF NOT EXISTS message_payload_purges (
+    chat_jid TEXT NOT NULL,
+    msg_id TEXT NOT NULL,
+    purged_at INTEGER NOT NULL,
+    deleted_at INTEGER NOT NULL,
+    deletion_reason TEXT NOT NULL,
+    PRIMARY KEY (chat_jid, msg_id)
+);
+
+`, "", 1)
+	if _, err := raw.Exec(legacySchema + `
 		CREATE TABLE schema_migrations (
 			version INTEGER PRIMARY KEY,
 			name TEXT NOT NULL,
 			applied_at INTEGER NOT NULL
 		);
-		INSERT INTO chats(jid, kind) VALUES('legacy@s.whatsapp.net', 'dm');
-		INSERT INTO messages(chat_jid, msg_id, ts, from_me, text)
-		VALUES('legacy@s.whatsapp.net', 'pre-provider-addressing', 1, 0, 'legacy');
+		INSERT INTO chats(jid, kind, name) VALUES('chat@s.whatsapp.net', 'dm', 'Alice');
+		INSERT INTO messages(chat_jid, msg_id, ts, from_me, text, display_text, media_type, filename, revoked, buttons)
+		VALUES('chat@s.whatsapp.net', 'mid', 123, 1, 'retained text', 'retained display', 'document', 'proof.pdf', 1, '[{"type":"url","display_text":"Open","url":"https://example.com"}]');
 	`); err != nil {
 		_ = raw.Close()
-		t.Fatalf("create migration-21 store: %v", err)
+		t.Fatalf("create legacy store: %v", err)
 	}
 	for _, migration := range schemaMigrations {
-		if migration.version > 21 {
+		if migration.version >= 21 {
 			continue
 		}
 		if _, err := raw.Exec(`INSERT INTO schema_migrations(version, name, applied_at) VALUES(?, ?, 1)`, migration.version, migration.name); err != nil {
 			_ = raw.Close()
-			t.Fatalf("record migration %d: %v", migration.version, err)
+			t.Fatal(err)
 		}
 	}
 	if err := raw.Close(); err != nil {
-		t.Fatalf("raw close: %v", err)
+		t.Fatal(err)
 	}
 
 	db, err := Open(path)
 	if err != nil {
-		t.Fatalf("Open migration-21 store: %v", err)
+		t.Fatalf("Open migrated store: %v", err)
 	}
 	defer db.Close()
-	for _, column := range []string{"mentions_me", "replies_to_me"} {
-		has, err := db.tableHasColumn("messages", column)
-		if err != nil {
-			t.Fatalf("tableHasColumn(%s): %v", column, err)
-		}
-		if !has {
-			t.Fatalf("migration 22 did not add messages.%s", column)
-		}
+	msg, err := db.GetMessage("chat@s.whatsapp.net", "mid")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := countRows(t, db.sql, `SELECT COUNT(*) FROM schema_migrations WHERE version = 22`); got != 1 {
-		t.Fatalf("migration 22 records = %d, want 1", got)
+	if msg.Text != "retained text" || msg.DisplayText != "retained display" || msg.MediaType != "document" || msg.Filename != "proof.pdf" || len(msg.Buttons) != 1 {
+		t.Fatalf("migrated payload = %+v", msg)
 	}
-	var mentionsMe sql.NullInt64
-	var repliesToMe sql.NullInt64
-	if err := db.sql.QueryRow(`
-		SELECT mentions_me, replies_to_me
-		FROM messages
-		WHERE msg_id = 'pre-provider-addressing'
-	`).Scan(&mentionsMe, &repliesToMe); err != nil {
-		t.Fatalf("read migrated provider addressing: %v", err)
-	}
-	if mentionsMe.Valid || repliesToMe.Valid {
-		t.Fatalf("migration 22 fabricated provider addressing values: mentions valid=%v replies valid=%v", mentionsMe.Valid, repliesToMe.Valid)
+	if msg.DeletedAt == nil || msg.DeletedAt.Unix() != 123 || msg.DeletionReason != "legacy-whatsapp-revoke" {
+		t.Fatalf("migrated tombstone = %v %q", msg.DeletedAt, msg.DeletionReason)
 	}
 }
 
@@ -700,14 +638,200 @@ func indexExists(t *testing.T, db *sql.DB, name string) bool {
 	return found == name
 }
 
-// TestOld927StoreUpgradeGainsMessageChangesMachinery pins the highest-risk
-// merge seam: the DEPLOYED 0.11.2-wave.927 staging store recorded version 21
-// with the OLD branch's semantics ("messages provider addressing columns"), so
-// this merged binary's version loop SKIPS 21 ("message changes") on such a
-// store. Correctness rides entirely on ensureCurrentSchema unconditionally
-// re-running the idempotent migrateMessageChanges; if that safety net is ever
-// removed, a 927-deployed store silently ships without the change stream —
-// this test is what fails first.
+func TestOpenRepairsRecordedMessageLocationsMigrationMissingTable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wacli.db")
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := raw.Exec(`
+		DROP TABLE message_locations;
+		INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES(25, 'message locations', 1);
+	`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("create inconsistent schema: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
+	}
+
+	db, err = Open(path)
+	if err != nil {
+		t.Fatalf("Open repaired DB: %v", err)
+	}
+	defer db.Close()
+
+	if ok, err := db.tableExists("message_locations"); err != nil || !ok {
+		t.Fatalf("message_locations exists=%v err=%v", ok, err)
+	}
+	if err := db.UpsertMessageLocation(MessageLocation{
+		ChatJID: "15551112222@s.whatsapp.net", MsgID: "LOC-1", Latitude: 1, Longitude: 2,
+	}); err != nil {
+		t.Fatalf("UpsertMessageLocation after schema repair: %v", err)
+	}
+}
+
+func TestFreshStoreRunsMigrationsThrough27AndMatchesEmbeddedMessageSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wacli.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open fresh: %v", err)
+	}
+	defer db.Close()
+
+	rows, err := db.sql.Query(`SELECT version, name FROM schema_migrations ORDER BY version`)
+	if err != nil {
+		t.Fatalf("read schema migrations: %v", err)
+	}
+	defer rows.Close()
+	for index, want := range schemaMigrations {
+		if !rows.Next() {
+			t.Fatalf("schema migrations stopped at %d, want migration %d", index, want.version)
+		}
+		var version int
+		var name string
+		if err := rows.Scan(&version, &name); err != nil {
+			t.Fatalf("scan schema migration: %v", err)
+		}
+		if version != want.version || name != want.name {
+			t.Fatalf("schema migration %d = (%d, %q), want (%d, %q)", index, version, name, want.version, want.name)
+		}
+	}
+	if rows.Next() {
+		t.Fatal("fresh store recorded an unexpected migration after 27")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate schema migrations: %v", err)
+	}
+
+	reference, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "schema-reference.db"))
+	if err != nil {
+		t.Fatalf("open schema reference: %v", err)
+	}
+	defer reference.Close()
+	if _, err := reference.Exec(coreSchemaSQL); err != nil {
+		t.Fatalf("apply embedded schema: %v", err)
+	}
+	schemaRows, err := reference.Query(`
+		SELECT type, name, sql
+		FROM sqlite_schema
+		WHERE type IN ('table', 'index') AND sql IS NOT NULL
+		ORDER BY type, name
+	`)
+	if err != nil {
+		t.Fatalf("read embedded schema objects: %v", err)
+	}
+	for schemaRows.Next() {
+		var objectType string
+		var name string
+		var wantSQL string
+		if err := schemaRows.Scan(&objectType, &name, &wantSQL); err != nil {
+			_ = schemaRows.Close()
+			t.Fatalf("scan embedded schema object: %v", err)
+		}
+		var gotSQL string
+		if err := db.sql.QueryRow(`SELECT sql FROM sqlite_schema WHERE type = ? AND name = ?`, objectType, name).Scan(&gotSQL); err != nil {
+			_ = schemaRows.Close()
+			t.Fatalf("read fresh schema object %s %s: %v", objectType, name, err)
+		}
+		if gotSQL != wantSQL {
+			_ = schemaRows.Close()
+			t.Fatalf("fresh schema object %s %s does not match schema.sql", objectType, name)
+		}
+	}
+	if err := schemaRows.Err(); err != nil {
+		_ = schemaRows.Close()
+		t.Fatalf("iterate embedded schema objects: %v", err)
+	}
+	if err := schemaRows.Close(); err != nil {
+		t.Fatalf("close embedded schema objects: %v", err)
+	}
+	if got := countRows(t, db.sql, `
+		SELECT COUNT(*)
+		FROM pragma_table_info('messages')
+		WHERE name IN ('mentions_me', 'replies_to_me')
+		  AND "notnull" = 0
+		  AND dflt_value IS NULL
+	`); got != 2 {
+		t.Fatalf("nullable provider-addressing columns without defaults = %d, want 2", got)
+	}
+}
+
+func TestMigration27UpgradesMigration26StoreWithoutFabricatingFalse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wacli.db")
+	raw, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	migration21Schema := strings.Replace(coreSchemaSQL, "    mentions_me INTEGER,\n", "", 1)
+	migration21Schema = strings.Replace(migration21Schema, "    replies_to_me INTEGER,\n", "", 1)
+	if _, err := raw.Exec(migration21Schema + `
+		CREATE TABLE schema_migrations (
+			version INTEGER PRIMARY KEY,
+			name TEXT NOT NULL,
+			applied_at INTEGER NOT NULL
+		);
+		INSERT INTO chats(jid, kind) VALUES('legacy@s.whatsapp.net', 'dm');
+		INSERT INTO messages(chat_jid, msg_id, ts, from_me, text)
+		VALUES('legacy@s.whatsapp.net', 'pre-provider-addressing', 1, 0, 'legacy');
+	`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("create migration-26 store: %v", err)
+	}
+	for _, migration := range schemaMigrations {
+		if migration.version > 26 {
+			continue
+		}
+		if _, err := raw.Exec(`INSERT INTO schema_migrations(version, name, applied_at) VALUES(?, ?, 1)`, migration.version, migration.name); err != nil {
+			_ = raw.Close()
+			t.Fatalf("record migration %d: %v", migration.version, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
+	}
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open migration-26 store: %v", err)
+	}
+	defer db.Close()
+	for _, column := range []string{"mentions_me", "replies_to_me"} {
+		has, err := db.tableHasColumn("messages", column)
+		if err != nil {
+			t.Fatalf("tableHasColumn(%s): %v", column, err)
+		}
+		if !has {
+			t.Fatalf("migration 27 did not add messages.%s", column)
+		}
+	}
+	if got := countRows(t, db.sql, `SELECT COUNT(*) FROM schema_migrations WHERE version = 27`); got != 1 {
+		t.Fatalf("migration 27 records = %d, want 1", got)
+	}
+	var mentionsMe sql.NullInt64
+	var repliesToMe sql.NullInt64
+	if err := db.sql.QueryRow(`
+		SELECT mentions_me, replies_to_me
+		FROM messages
+		WHERE msg_id = 'pre-provider-addressing'
+	`).Scan(&mentionsMe, &repliesToMe); err != nil {
+		t.Fatalf("read migrated provider addressing: %v", err)
+	}
+	if mentionsMe.Valid || repliesToMe.Valid {
+		t.Fatalf("migration 27 fabricated provider addressing values: mentions valid=%v replies valid=%v", mentionsMe.Valid, repliesToMe.Valid)
+	}
+}
+
 func TestOld927StoreUpgradeGainsMessageChangesMachinery(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "wacli.db")
 	raw, err := sql.Open("sqlite3", path)
@@ -856,5 +980,89 @@ func TestEnsureCurrentSchemaRepairsMissingAddressingColumn(t *testing.T) {
 	}
 	if !has {
 		t.Fatal("writable open did not repair the missing addressing column")
+	}
+}
+
+// TestWaveShapedStoreUpgradeGainsUpstreamSchema pins the merge seam that the
+// DEPLOYED 0.12.1-wave.1177.x stores hit: they recorded versions 1..22 where
+// 21 = "message changes" and 22 = "messages provider addressing columns"
+// (pre-merge fork numbering). The merged binary numbers upstream's tombstone
+// metadata / local media aliases / app-state recovery / message locations as
+// 21..25, so the version loop SKIPS 21 and 22 on such a store. Correctness
+// rides on ensureCurrentSchema re-running every idempotent guard.
+func TestWaveShapedStoreUpgradeGainsUpstreamSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wacli.db")
+	raw, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := strings.Replace(coreSchemaSQL, "    deleted_at INTEGER,\n    deletion_reason TEXT,\n    payload_purged_at INTEGER,\n", "", 1)
+	if legacy == coreSchemaSQL {
+		t.Fatal("test fixture did not strip the tombstone columns; update the marker")
+	}
+	legacy = dropSchemaStatement(t, legacy, "CREATE TABLE IF NOT EXISTS message_payload_purges")
+	legacy = dropSchemaStatement(t, legacy, "CREATE TABLE IF NOT EXISTS message_locations")
+	if _, err := raw.Exec(legacy + `
+		CREATE TABLE schema_migrations (
+			version INTEGER PRIMARY KEY,
+			name TEXT NOT NULL,
+			applied_at INTEGER NOT NULL
+		);
+		INSERT INTO chats(jid, kind) VALUES('legacy@s.whatsapp.net', 'dm');
+		INSERT INTO messages(chat_jid, msg_id, ts, from_me, text, mentions_me, ingest_origin)
+		VALUES('legacy@s.whatsapp.net', 'pre-merge', 1, 0, 'legacy', NULL, 'live');
+	`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("create wave-shaped store: %v", err)
+	}
+	for _, migration := range schemaMigrations {
+		if migration.version > 20 {
+			continue
+		}
+		if _, err := raw.Exec(`INSERT INTO schema_migrations(version, name, applied_at) VALUES(?, ?, 1)`, migration.version, migration.name); err != nil {
+			_ = raw.Close()
+			t.Fatalf("record migration %d: %v", migration.version, err)
+		}
+	}
+	if _, err := raw.Exec(`
+		INSERT INTO schema_migrations(version, name, applied_at) VALUES(21, 'message changes', 1);
+		INSERT INTO schema_migrations(version, name, applied_at) VALUES(22, 'messages provider addressing columns', 1);
+	`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("record wave migrations: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open wave-shaped store: %v", err)
+	}
+	defer db.Close()
+	for _, column := range []string{"deleted_at", "deletion_reason", "payload_purged_at", "mentions_me", "replies_to_me", "ingest_origin"} {
+		has, err := db.tableHasColumn("messages", column)
+		if err != nil {
+			t.Fatalf("tableHasColumn(%s): %v", column, err)
+		}
+		if !has {
+			t.Fatalf("wave-shaped upgrade left messages.%s missing", column)
+		}
+	}
+	for _, table := range []string{"message_payload_purges", "message_locations", "message_changes", "store_meta"} {
+		has, err := db.tableExists(table)
+		if err != nil {
+			t.Fatalf("tableExists(%s): %v", table, err)
+		}
+		if !has {
+			t.Fatalf("wave-shaped upgrade left %s missing", table)
+		}
+	}
+	msg, err := db.GetMessage("legacy@s.whatsapp.net", "pre-merge")
+	if err != nil {
+		t.Fatalf("GetMessage after upgrade: %v", err)
+	}
+	if msg.Text != "legacy" || msg.MentionsMe != nil {
+		t.Fatalf("upgrade altered the legacy row: %+v", msg)
 	}
 }

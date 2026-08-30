@@ -7,7 +7,7 @@ Read when: running continuous capture, one-shot sync, contact/group refresh, or 
 ## Command
 
 ```bash
-wacli sync [--once] [--follow] [--idle-exit 30s] [--max-reconnect 5m] [--stale-threshold DURATION] [--presence-mode normal|quiet] [--max-messages N] [--max-db-size SIZE] [--download-media] [--refresh-contacts] [--refresh-groups] [--refresh-channels] [--events] [--webhook URL] [--webhook-secret SECRET]
+wacli sync [--once] [--follow] [--idle-exit 30s] [--max-reconnect 5m] [--stale-threshold DURATION] [--presence-mode normal|quiet] [--send-spacing DURATION|MIN-MAX] [--max-messages N] [--max-db-size SIZE] [--download-media] [--refresh-contacts] [--refresh-groups] [--refresh-channels] [--events] [--webhook URL] [--webhook-secret SECRET] [--webhook-events LIST]
 ```
 
 ## Modes
@@ -16,29 +16,68 @@ wacli sync [--once] [--follow] [--idle-exit 30s] [--max-reconnect 5m] [--stale-t
 - `--once` exits after sync becomes idle.
 - `--idle-exit` controls idle exit timing in once mode.
 - `--max-reconnect 0` keeps reconnecting indefinitely.
+- If WhatsApp revokes the linked session, sync emits a terminal `logged_out` event, cancels any reconnect already in progress, and exits cleanly. Re-pair with `wacli auth logout` followed by `wacli auth --phone`.
 - `--max-messages N` stops before storing more than `N` total messages locally.
 - `--max-db-size SIZE` stops when `wacli.db` plus SQLite sidecars reaches `SIZE` (`500MB`, `2GB`, etc.).
 - `--download-media` runs a bounded media downloader for sync events. Clean one-shot and bootstrap runs finish queued downloads before exiting; cancellation, errors, and storage-limit exits stop immediately.
+- `--send-spacing DURATION|MIN-MAX` paces serialized sends delegated to a running follow process. A single duration such as `2s` sets a fixed minimum gap; a range such as `500ms-5s` chooses a fresh random gap for each send. It is disabled by default, so unset behavior remains unchanged. The caller's command timeout includes time queued behind earlier sends, pacing, and the send itself; a request that runs out of time is not dispatched.
 - `--refresh-contacts` imports contacts from the session store.
 - `--refresh-groups` fetches joined groups live and updates the local DB.
 - `--refresh-channels` fetches subscribed WhatsApp Channels live and updates local chat rows.
-- `--webhook URL` posts successfully stored live message events as JSON on a bounded background worker.
+- `--webhook URL` posts successfully stored live message events as JSON on a bounded background worker. The payload includes `ChatName` when a locally resolved chat name is available.
 - `--webhook-secret SECRET` signs webhook payloads with `X-Wacli-Signature: sha256=<hmac>`.
+- `--webhook-events LIST` selects which event types are posted, as a comma-separated list of `message`, `receipt`, and `chat_presence`. The default is `message`, which preserves the earlier message event shape. A list that omits `message` stops message posts, so `--webhook-events receipt` posts receipts only. `chat_presence` needs `--presence-mode normal` (the default): WhatsApp only sends typing notifications to devices that mark themselves available. See [Webhook payloads](#webhook-payloads).
 - Webhook delivery is best-effort: failures, request timeouts, and full-queue drops are logged as warnings and do not stop sync. Retries/backoff are intentionally out of scope for this flag.
 - If neither storage cap is configured, sync prints one warning because WhatsApp history can grow the local database substantially.
 - `WACLI_SYNC_MAX_MESSAGES` and `WACLI_SYNC_MAX_DB_SIZE` apply the same caps to `auth` bootstrap sync and `sync`.
-- While `sync --follow` is running, `send text`, `send file`, `send sticker`, `send voice`, and `send react` commands for the same store are delegated to the running sync process so they do not fail on the store lock.
+- While `sync --follow` is running, `send text`, `send file`, `send sticker`, `send voice`, `send react`, and `messages edit` commands for the same store are delegated to the running sync process so they do not fail on the store lock.
 - After connecting, sync fetches WhatsApp chat app-state deltas (`regular_high` and `regular_low`) so starred, delete-for-me, mute, archive, pin, and mark-read changes made while `wacli` was offline are caught up instead of relying only on live push notifications.
 - Sync imports messages sent from your other linked devices into the destination chat with `from_me=true`, so local history covers both incoming and outgoing conversation sides.
 - If whatsmeow reports an app-state LTHash mismatch, sync asks the primary device for the official recovery snapshot once for that app-state collection. If recovery also fails, the warning is printed and sync keeps handling normal message/history events.
 - Sync stores WhatsApp call signaling and call-log metadata in `call_events`; inspect it with `wacli calls list`.
 - Sync stores WhatsApp status broadcasts in `status_messages`, separate from normal chat `messages`.
+- Sync stores location pins and live-location shares in `message_locations`, keyed by (`chat_jid`, `msg_id`); the message row keeps `media_type=location` (or `live_location`). Pins synced before this table existed have no coordinates and cannot be backfilled.
 - In an interactive terminal, routine connected/history/progress updates share one updating stderr status line. Warnings and errors still print as separate lines so they remain visible.
 - `--stale-threshold DURATION` in follow mode detects keepalive failures. If whatsmeow reports that the last successful keepalive is older than this duration, sync force-closes the connection and reconnects. Healthy quiet sessions are not reconnected just because no chat events arrive. Disabled by default (`0`); accepted values are `1s` up to but not including `2m20s`, which reserves one maximum keepalive probe interval plus response deadline before whatsmeow's own 3-minute auto-reconnect window.
 - `--presence-mode normal|quiet` controls global linked-device presence during sync. `normal` is the default and preserves the existing behavior: sync sends available presence after connecting or receiving a push-name update, then sends unavailable presence on cleanup. `quiet` suppresses the available-presence sends while keeping the final unavailable cleanup; use it for personal-number mirrors where keeping primary-phone notifications audible matters. WhatsApp ultimately controls notification routing, so this mode avoids the active linked-device signal but cannot guarantee phone behavior on every platform.
 - A `stale` NDJSON event is emitted when the threshold is exceeded, containing `threshold`, `idle_duration`, `error_count`, and `source` fields.
 - While `sync --follow` is running, a `HEARTBEAT` file is written to the store directory (at most once per minute) with the last observed follow activity timestamp in RFC 3339 format. External watchdogs or `wacli doctor` can read this as an activity marker; quiet healthy sessions may not update it because successful keepalives are silent, and keepalive health is reported separately through `stale` events.
 - `--events` emits one NDJSON lifecycle event per stderr line for machine consumers. Routine human progress/status lines, interrupt prompts, and command errors are emitted as events while events are enabled.
+
+## Webhook payloads
+
+Webhook payloads remain flat JSON objects. Receipt and chat-presence payloads carry
+an `EventType` discriminator. Message payloads deliberately omit it so existing
+consumers retain the established object shape; a missing `EventType` means
+`message`. Every JID field uses the same identity namespace as the local store:
+known LIDs are resolved to phone JIDs, while unknown LIDs remain unchanged.
+
+Messages use the stored live message payload documented above:
+
+```json
+{"Chat":"15551234567@s.whatsapp.net","ID":"3EB0…","SenderJID":"15551234567@s.whatsapp.net","Timestamp":"2026-07-25T10:00:00Z","FromMe":false,"Text":"hi","ChatName":"Alice"}
+```
+
+`EventType: "receipt"` reports delivery and read state for messages you sent. Only
+`delivered`, `read`, and `played` cross the webhook; the protocol bookkeeping types
+(`sender`, `retry`, `read-self`, `played-self`, `inactive`, `server-error`, `peer_msg`,
+`hist_sync`) are dropped at the source so they cannot crowd out real messages. The
+`delivered` type is spelled out explicitly, even though WhatsApp sends it as an empty
+string on the wire. `MessageIDs` keeps WhatsApp's batching (one POST per receipt, not per message,
+minus any blank IDs), and in groups `Sender` is the participant the receipt came
+from:
+
+```json
+{"EventType":"receipt","Chat":"120363000000000000@g.us","Sender":"15551234567@s.whatsapp.net","MessageIDs":["3EB0…"],"Timestamp":"2026-07-25T10:00:01Z","Type":"delivered","IsFromMe":false}
+```
+
+`EventType: "chat_presence"` reports per-chat typing state. `Media` is `audio` while the
+contact records a voice message and empty otherwise. Global presence (`online` / last
+seen) is deliberately not forwarded:
+
+```json
+{"EventType":"chat_presence","Chat":"15551234567@s.whatsapp.net","Sender":"15551234567@s.whatsapp.net","State":"composing","Media":""}
+```
 
 ## Examples
 
@@ -47,10 +86,12 @@ wacli sync --once
 wacli sync --follow --max-reconnect 10m
 wacli sync --follow --stale-threshold 2m
 wacli sync --follow --presence-mode quiet
+wacli sync --follow --send-spacing 500ms-5s
 wacli sync --follow --max-messages 250000 --max-db-size 2GB
 wacli sync --once --refresh-contacts --refresh-groups --refresh-channels
 wacli sync --follow --download-media
 wacli sync --once --events 2>events.ndjson
 wacli sync --follow --stale-threshold 2m --events 2>events.ndjson
 wacli sync --follow --webhook https://example.com/wacli --webhook-secret "$WACLI_WEBHOOK_SECRET"
+wacli sync --follow --webhook https://example.com/wacli --webhook-events message,receipt,chat_presence
 ```

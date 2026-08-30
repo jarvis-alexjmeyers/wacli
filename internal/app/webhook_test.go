@@ -24,7 +24,7 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
-func TestHandleLiveSyncMessagePostsSignedWebhook(t *testing.T) {
+func TestHandleLiveSyncMessagePostsSignedWebhookWithGroupName(t *testing.T) {
 	a := newTestApp(t)
 	f := newFakeWA()
 	a.wa = f
@@ -49,24 +49,28 @@ func TestHandleLiveSyncMessagePostsSignedWebhook(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	chat := types.JID{User: "15551234567", Server: types.DefaultUserServer}
+	chat := types.JID{User: "120363000000000000", Server: types.GroupServer}
+	f.groups[chat] = &types.GroupInfo{
+		JID:       chat,
+		GroupName: types.GroupName{Name: "test1"},
+	}
 	evt := &events.Message{
 		Info: types.MessageInfo{
 			MessageSource: types.MessageSource{
 				Chat:     chat,
-				Sender:   chat,
+				Sender:   types.JID{User: "15551234567", Server: types.DefaultUserServer},
 				IsFromMe: false,
-				IsGroup:  false,
+				IsGroup:  true,
 			},
 			ID:        "m-live",
 			Timestamp: time.Date(2024, 1, 3, 0, 0, 0, 0, time.UTC),
-			PushName:  "Alice",
+			PushName:  "",
 		},
 		Message: &waProto.Message{Conversation: proto.String("hello")},
 	}
 
 	var messagesStored atomic.Int64
-	jobs := make(chan wa.ParsedMessage, 1)
+	jobs := make(chan syncWebhookEvent, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stopWebhook := a.runSyncWebhookWorker(ctx, SyncOptions{
@@ -80,7 +84,7 @@ func TestHandleLiveSyncMessagePostsSignedWebhook(t *testing.T) {
 		WebhookURL:          srv.URL,
 		WebhookSecret:       "supersecret",
 		WebhookAllowPrivate: true,
-	}, evt, &messagesStored, func(string, string) {}, a.newSyncWebhookEnqueuer(ctx, jobs))
+	}, evt, &messagesStored, func(string, string) {}, newSyncWebhookMessageEnqueuer(a.newSyncWebhookEnqueuer(ctx, jobs)))
 
 	if messagesStored.Load() != 1 {
 		t.Fatalf("messages stored = %d, want 1", messagesStored.Load())
@@ -98,7 +102,14 @@ func TestHandleLiveSyncMessagePostsSignedWebhook(t *testing.T) {
 	if got.signature != syncWebhookSignature("supersecret", got.body) {
 		t.Fatalf("signature = %q, want %q", got.signature, syncWebhookSignature("supersecret", got.body))
 	}
-	for _, want := range [][]byte{[]byte(`"ID":"m-live"`), []byte(`"Text":"hello"`)} {
+	if bytes.Contains(got.body, []byte(`"EventType"`)) {
+		t.Fatalf("legacy message payload gained EventType: %s", got.body)
+	}
+	for _, want := range [][]byte{
+		[]byte(`"ChatName":"test1"`),
+		[]byte(`"ID":"m-live"`),
+		[]byte(`"Text":"hello"`),
+	} {
 		if !bytes.Contains(got.body, want) {
 			t.Fatalf("webhook body missing %s: %s", want, got.body)
 		}
@@ -119,7 +130,7 @@ func TestHandleLiveSyncMessageDoesNotBlockOnWebhookDelivery(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	jobs := make(chan wa.ParsedMessage, 1)
+	jobs := make(chan syncWebhookEvent, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stopWebhook := a.runSyncWebhookWorker(ctx, SyncOptions{WebhookURL: srv.URL, WebhookAllowPrivate: true}, jobs)
@@ -138,7 +149,7 @@ func TestHandleLiveSyncMessageDoesNotBlockOnWebhookDelivery(t *testing.T) {
 	var messagesStored atomic.Int64
 	returned := make(chan struct{})
 	go func() {
-		a.handleLiveSyncMessage(context.Background(), SyncOptions{WebhookURL: srv.URL, WebhookAllowPrivate: true}, evt, &messagesStored, func(string, string) {}, a.newSyncWebhookEnqueuer(ctx, jobs))
+		a.handleLiveSyncMessage(context.Background(), SyncOptions{WebhookURL: srv.URL, WebhookAllowPrivate: true}, evt, &messagesStored, func(string, string) {}, newSyncWebhookMessageEnqueuer(a.newSyncWebhookEnqueuer(ctx, jobs)))
 		close(returned)
 	}()
 
@@ -167,7 +178,10 @@ func TestPostSyncWebhookRejectsLocalhostByDefault(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	err := a.postSyncWebhook(context.Background(), SyncOptions{WebhookURL: srv.URL}, wa.ParsedMessage{ID: "m-local"})
+	err := a.postSyncWebhookEvent(context.Background(), SyncOptions{WebhookURL: srv.URL}, syncWebhookEvent{
+		Kind:    SyncWebhookEventMessage,
+		Message: wa.ParsedMessage{ID: "m-local"},
+	})
 	if err == nil {
 		t.Fatal("expected localhost webhook to be rejected")
 	}
@@ -199,10 +213,10 @@ func TestPostSyncWebhookUsesRequestTimeout(t *testing.T) {
 	}
 
 	start := time.Now()
-	err := a.postSyncWebhook(context.Background(), SyncOptions{
+	err := a.postSyncWebhookEvent(context.Background(), SyncOptions{
 		WebhookURL:          "https://example.test/hook",
 		WebhookAllowPrivate: true,
-	}, wa.ParsedMessage{ID: "m-timeout"})
+	}, syncWebhookEvent{Kind: SyncWebhookEventMessage, Message: wa.ParsedMessage{ID: "m-timeout"}})
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}

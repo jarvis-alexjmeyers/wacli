@@ -1,36 +1,156 @@
 # Changelog
 
-## 0.12.2 - Unreleased
+## 0.17.1-wave.1 - Unreleased
 
-### Added
+### Added (Wave fork)
 
-- Sync: add opt-in quiet presence mode to suppress initial available-presence and reconnect updates during long-running sync sessions. (#298 - thanks @GodsBoy)
-- Changes: add a monotonic, store-instance-scoped message change cursor with read-only `changes list/status` commands and prune-aware gap detection.
+- Changes: add a monotonic, store-instance-scoped message change cursor with read-only `changes list/status` commands and prune-aware gap detection. (AITOOLS-938)
+- Sync: derive `MentionsMe` / `RepliesToMe` tri-state columns and `ingest_origin` from ContextInfo, persisted with precedence through LID migration. (AITOOLS-927, AITOOLS-938)
+- Groups: read a group's participants from the local store without holding the connect lock, with LID-to-phone resolution and `LeftAt` in table output.
+- Build: report `0.17.1-wave.1` as the fork's version.
 
-### Fixed
-
-- Store: normalize Windows drive paths before generating SQLite file URIs to prevent invalid URI authority errors. (#304 - thanks @goutamadwant)
-
-## 0.12.1-wave.938 - 2026-07-17
+## v0.17.1 - 2026-08-14
 
 ### Fixed
 
-- Changes: preserve nullable `MentionsMe` and `RepliesToMe` values in change-stream message objects after combining the AITOOLS-927 and AITOOLS-938 store migrations.
-- Build: pin Wave's AITOOLS-938 artifact version to `0.12.1-wave.938`.
+- Auth: stop with an actionable error when WhatsApp requires unsupported passkey pairing instead of silently rotating unusable QR codes. (#355 - thanks @Avg8888)
+- Sync: normalize resolvable LIDs in message, receipt, and chat-presence webhook payloads to match stored identities. (#352 - thanks @hchittanuru3)
+## v0.17.0 - 2026-08-13
 
-## 0.12.1 - 2026-07-09
+**Highlight:** group identities are finally stable — resolvable LIDs are
+normalized everywhere they appear, and existing stores are repaired on upgrade.
+
+### Fixed
+
+- Sync: normalize resolvable LIDs in group owners, participants, and quoted senders, including historical store repair. (#348 - thanks @hchittanuru3)
 
 ### Added
+
+- Messages: expose persisted edited state consistently in list, search, show, and context JSON output. (#347 - thanks @dvainrub)
+- Sync: identify unhandled payload types when content extraction produces a placeholder, with bounded diagnostics during history replay. (#344 - thanks @dvainrub)
+
+### Chore
+
+- Dependencies: update `whatsmeow` for current socket headers, LID history tokens, status queries, and group creation behavior.
+
+## 0.16.0 - 2026-08-02
+
+### Added
+
+- Locations: send native WhatsApp location pins and retain incoming static or live coordinates in local history with full purge, cleanup, and identity-migration lifecycle support. (#338 - thanks @0xlucuma)
+
+### Fixed
+
+- Groups: preserve message-derived chat activity when refreshing group metadata so `chats list` ordering is not replaced by refresh time. (#340 - thanks @goutamadwant)
+
+### Chore
+
+- Dependencies: update `go-sqlite3`, `whatsmeow`, database tooling, gRPC, WebAssembly, telemetry, and supporting Go modules.
+
+## 0.15.2 - 2026-08-02
+
+### Added
+
+- Contacts: add `contacts check <phone> [phone...]` to query live whether numbers are registered on WhatsApp, with JSON output for scripting; per-number `responded` distinguishes a server non-answer from a confirmed "not registered". (#331)
+
+### Fixed
+
+- Send: surface local history failures after a delivered file, voice, or status send as a `store_warning` (stderr warning plus JSON field) instead of silently diverging local history, while keeping the delivered message id so scripts do not retry an already-sent message. (#328 - thanks @SebTardif)
+- Send: extend the `store_warning` partial-success contract to every remaining send surface — text, sticker, reactions, polls, poll votes, button/list selections, and message forwarding — including sends delegated to a running `sync --follow` process.
+
+### Docs
+
+- README: align the project overview, install paths, quickstart, and command map with the shared documentation standard.
+
+## 0.15.1 - 2026-08-01
+
+### Added
+
+- Sync: add opt-in `--send-spacing` fixed or randomized pacing for sends delegated to a running follow process. (#318 - thanks @cohnen)
+- Sync: add opt-in receipt and chat-presence webhook events while keeping legacy message payloads unchanged. (#315 - thanks @Jaime-data)
+
+### Fixed
+
+- Sync: stop promptly when WhatsApp revokes the linked session, including while a reconnect is already in progress, and print the re-authentication steps. (#325 - thanks @cohnen)
+- Send: keep self-chat storage under the canonical phone-number chat and reject text sends to the linked account itself instead of reporting an acknowledgement that may never reach Message Yourself. (#319 - thanks @Lucas-Kim-J)
+- Send: resolve quoted direct messages across phone-number and LID chat aliases so replies can find migrated history. (#326 - thanks @0xlucuma)
+
+### Chore
+
+- Dependencies: update `whatsmeow`, terminal support, GraphQL parsing, and supporting Go modules.
+- Tooling: update the pinned pnpm version from 10.34.4 to 11.18.0.
+- Build: migrate `sqlc` code generator to Go 1.24+ `go tool` directive and bump project toolchain requirement to Go 1.26.5. (#313 - thanks @thedavidweng)
+- Build: standardize the Makefile's build, check, snapshot, and verified local-release targets across the crawler repositories.
+- Release: publish v0.15.0 under a one-time clean-VM Gatekeeper waiver, with retroactive VM proof still required when hardware returns, and verify preserved drafts against their release commit's Go toolchain.
+
+## 0.15.0 - 2026-07-23
+
+### Highlights
+
+- Send files with an explicit WhatsApp media type, so an MP3 can be delivered as a downloadable document while retaining its audio MIME type. (thanks @DiegoDAF)
+- Webhooks now include the locally resolved chat name when it is available. (#312 - thanks @g1e2x87)
+
+### Added
+
+- Send: add `send file --as auto|document|audio|image|video` to choose the WhatsApp media type independently of MIME, including downloadable MP3 documents. (thanks @DiegoDAF)
+
+### Fixed
+
+- Sync: include locally resolved chat names in webhook payloads when available. (#312 - thanks @g1e2x87)
+
+## 0.14.0 - 2026-07-19
+
+### Highlights
+
+- Deleted messages now keep their original payload behind timestamped tombstones, with an explicit confirmation-gated purge command for irreversible erasure.
+- Message edits now delegate through a running `sync --follow` process instead of failing while the sync process owns the store lock. (#310 - thanks @Umair444)
+- Text replies can again quote stored documents and other supported media. (#307 - thanks @suifatt7799-oss)
+
+### Added
+
+- Messages: add an explicit, confirmation-gated `messages purge` command that irreversibly erases one retained payload while keeping a durable suppression tombstone.
+
+### Changed
+
+- Messages: retain original text, interactive, reply, and media metadata behind timestamped deletion tombstones; keep sync/history imports merge-only so missing rows never imply deletion.
+- WhatsApp compatibility: update `whatsmeow` for the latest protocol definitions and its required utility module.
+
+### Fixed
+
+- Store: preserve duplicate local media paths across LID-to-phone-number migration so a later payload purge erases every retained copy.
+- Send: delegate `messages edit` through a running `sync --follow` process like other send commands, so edits no longer always fail with `store is locked` while continuous sync owns the store. (#310 - thanks @Umair444)
+- Send: allow text replies to quote stored documents and other supported media by rebuilding their saved message content. (#307 - thanks @suifatt7799-oss)
+
+## 0.13.0 - 2026-07-17
+
+### Highlights
+
+- Sync can now stay quiet during long-running mirror sessions so the primary phone keeps normal notification behavior. (#298 - thanks @GodsBoy)
+- Text replies now carry complete quoted-message context through direct and delegated sends. (#302 - thanks @odilorg)
+- Windows auth and store access now handle drive-letter and UNC paths without invalid SQLite URI errors. (#304 - thanks @goutamadwant)
+- Official release artifacts now use a signed, notarized, provenance-bound draft-first pipeline with protected verification and Homebrew handoff.
+
+### Added
+
+- Sync: add opt-in `--presence-mode quiet` to suppress available-presence updates during long-running sync sessions while retaining safe unavailable cleanup. (#298 - thanks @GodsBoy)
+
+### Fixed
+
+- Messages: preserve quoted content, stanza IDs, and participants when replying to stored incoming or outgoing text messages, including through sync IPC delegation. (#302 - thanks @odilorg)
+- Windows: normalize drive-letter and UNC paths before constructing SQLite file URIs so auth and read-only store opens no longer fail with invalid URI authority. (#304 - thanks @goutamadwant)
+- WhatsApp compatibility: update `whatsmeow` for current protobufs, LID direct-message sends, pairing, and user lookup behavior. (#306)
 
 ### Security
 
 - Build: require Go 1.25.12 and gate source plus release binaries with `govulncheck` so reachable GO-2026-5856 standard-library paths are excluded.
 - Release: sign all official macOS thin and universal binaries with the exact OpenClaw Foundation Developer ID metadata and designated requirement, hardened runtime, timestamp, and Apple notarization before draft upload; require naturally quarantined clean-VM execution as the standalone CLI Gatekeeper proof.
 - Release: bind cross-build provenance and publication freshness to the current protected head, reject wrong linker/runtime versions and lookalike signing authorities, revalidate the exact draft and fresh published release by ID, and verify protected Homebrew handoff, formula stanzas, plus the installed binary's hash, architecture, signing identity, runtime, and notarization constraint.
-
-### Fixed
-
 - Release: move official publication to a local draft-first flow with authenticated cross-build provenance, separate protected-main native verification, a signed annotated exact tag, verified public-release and Homebrew manifests, and credential-free CI builds.
+
+### Changed
+
+- Dependencies: update `go-sqlite3`, the Go networking stack, and `whatsmeow` with its required transitive modules. (#305, #306)
+- Tooling: require Node.js 24 or newer and enforce a 48-hour minimum release age for pnpm packages. (thanks @vincentkoc)
 
 ## 0.12.0 - 2026-07-06
 
