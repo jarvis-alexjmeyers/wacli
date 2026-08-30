@@ -45,8 +45,8 @@ func newGroupsRefreshCmd(flags *rootFlags) *cobra.Command {
 					continue
 				}
 				joined[g.JID.String()] = true
-				_ = persistGroupInfo(a.DB(), g)
-				_ = a.DB().UpsertChat(g.JID.String(), "group", g.GroupName.Name, now)
+				_ = persistGroupInfo(ctx, a.DB(), a.WA(), g)
+				_ = a.DB().UpsertChatMetadata(g.JID.String(), "group", g.GroupName.Name)
 			}
 			if err := a.DB().MarkGroupsMissingFrom(joined, now); err != nil {
 				return err

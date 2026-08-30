@@ -101,8 +101,12 @@ type Message struct {
 	DownloadedAt    time.Time
 	Starred         bool
 	StarredAt       time.Time
+	Edited          bool
 	Revoked         bool
 	DeletedForMe    bool
+	DeletedAt       *time.Time `json:"deleted_at,omitempty"`
+	DeletionReason  string     `json:"deletion_reason,omitempty"`
+	PayloadPurgedAt *time.Time `json:"payload_purged_at,omitempty"`
 	Snippet         string
 	rowID           int64
 }
@@ -241,3 +245,6 @@ func (d *DB) HasFTS() bool { return d.ftsEnabled }
 
 const DeletedMessageDisplayText = "This message was deleted"
 const DeletedForMeMessageDisplayText = "This message was deleted for me"
+const MessageDeletionReasonWhatsAppRevoke = "whatsapp-revoke"
+const MessageDeletionReasonWhatsAppDeleteForMe = "whatsapp-delete-for-me"
+const MessageDeletionReasonExplicit = "explicit-message-delete"

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"testing"
@@ -31,16 +32,20 @@ func (a recipientTestApp) DB() *store.DB {
 }
 
 type recordingTextSender struct {
-	textCalls      int
-	text           string
-	protoCalls     int
-	protoMsg       *waProto.Message
-	protoRecipient types.JID
-	textRecipient  types.JID
-	nextTextID     types.MessageID
-	nextProtoMsgID types.MessageID
-	groupInfo      *types.GroupInfo
-	groupInfoCalls int
+	textCalls       int
+	text            string
+	protoCalls      int
+	protoMsg        *waProto.Message
+	protoRecipient  types.JID
+	textRecipient   types.JID
+	nextTextID      types.MessageID
+	nextProtoMsgID  types.MessageID
+	groupInfo       *types.GroupInfo
+	groupInfoCalls  int
+	linkedJID       string
+	linkedLID       types.JID
+	resolveLIDCalls int
+	lidToPN         types.JID
 }
 
 func (s *recordingTextSender) SendText(_ context.Context, to types.JID, text string) (types.MessageID, error) {
@@ -68,6 +73,42 @@ func (s *recordingTextSender) GetGroupInfo(_ context.Context, _ types.JID) (*typ
 	return s.groupInfo, nil
 }
 
+func (s *recordingTextSender) LinkedJID() string {
+	return s.linkedJID
+}
+
+func (s *recordingTextSender) LinkedLID() string {
+	return s.linkedLID.String()
+}
+
+func (s *recordingTextSender) ResolvePNToLID(_ context.Context, _ types.JID) types.JID {
+	s.resolveLIDCalls++
+	return s.linkedLID
+}
+
+func (s *recordingTextSender) ResolveLIDToPN(_ context.Context, jid types.JID) types.JID {
+	if !s.lidToPN.IsEmpty() {
+		return s.lidToPN
+	}
+	return jid
+}
+
+type outboundTextResolverStub struct {
+	lid types.JID
+	pn  types.JID
+}
+
+func (r outboundTextResolverStub) ResolveChatName(_ context.Context, chat types.JID, _ string) string {
+	return chat.String()
+}
+
+func (r outboundTextResolverStub) ResolveLIDToPN(_ context.Context, jid types.JID) types.JID {
+	if jid.ToNonAD() == r.lid {
+		return r.pn
+	}
+	return jid
+}
+
 func requireExtendedText(t *testing.T, msg *waProto.Message) *waProto.ExtendedTextMessage {
 	t.Helper()
 	if msg.GetEphemeralMessage() != nil {
@@ -89,6 +130,88 @@ func TestResolveRecipientFallsBackToFormattedPhone(t *testing.T) {
 	}
 	if got.String() != "15551234567@s.whatsapp.net" {
 		t.Fatalf("recipient = %q", got.String())
+	}
+}
+
+func TestSendTextToOwnPNRejectsRegisteredLID(t *testing.T) {
+	pn := types.NewJID("15551234567", types.DefaultUserServer)
+	lid := types.NewJID("999123456789", types.HiddenUserServer)
+	warmup := &mockUserInfoClient{
+		isOnWhatsApp: func(_ context.Context, phones []string) ([]types.IsOnWhatsAppResponse, error) {
+			if len(phones) != 1 || phones[0] != "+15551234567" {
+				t.Fatalf("registration lookup = %v", phones)
+			}
+			return []types.IsOnWhatsAppResponse{{JID: lid, PhoneNumber: pn, IsIn: true}}, nil
+		},
+		getUserInfo: func(_ context.Context, jids []types.JID) (map[types.JID]types.UserInfo, error) {
+			if len(jids) != 1 || jids[0] != lid {
+				t.Fatalf("user info target = %v, want %s", jids, lid)
+			}
+			return nil, nil
+		},
+	}
+
+	var stderr bytes.Buffer
+	target := warmupRecipient(context.Background(), warmup, pn, &stderr)
+	sender := &recordingTextSender{linkedJID: pn.String(), linkedLID: lid}
+	_, err := sendTextMessageWithSender(context.Background(), sender, openSendTestDB(t), target, "self-test", "", "", nil, nil, textEphemeralOptions{})
+	if err == nil || !strings.Contains(err.Error(), "linked account itself is not supported") {
+		t.Fatalf("sendTextMessageWithSender error = %v, want self-send rejection", err)
+	}
+	if sender.textCalls != 0 || sender.protoCalls != 0 {
+		t.Fatalf("self-send reached protocol sender: text=%d proto=%d", sender.textCalls, sender.protoCalls)
+	}
+	if sender.resolveLIDCalls != 0 {
+		t.Fatalf("ResolvePNToLID calls = %d, want 0", sender.resolveLIDCalls)
+	}
+}
+
+func TestSendTextToOwnPNRejectsWithoutRegistrationCanonicalization(t *testing.T) {
+	pn := types.NewJID("15551234567", types.DefaultUserServer)
+	sender := &recordingTextSender{linkedJID: pn.String()}
+
+	_, err := sendTextMessageWithSender(context.Background(), sender, openSendTestDB(t), pn, "self-test", "", "", nil, nil, textEphemeralOptions{})
+	if err == nil || !strings.Contains(err.Error(), "linked account itself is not supported") {
+		t.Fatalf("sendTextMessageWithSender error = %v, want self-send rejection", err)
+	}
+	if sender.textCalls != 0 || sender.protoCalls != 0 || sender.resolveLIDCalls != 0 {
+		t.Fatalf("self-send reached protocol path: text=%d proto=%d resolve=%d", sender.textCalls, sender.protoCalls, sender.resolveLIDCalls)
+	}
+}
+
+func TestPersistOutboundTextCanonicalizesSelfLIDToPN(t *testing.T) {
+	db := openSendTestDB(t)
+	pn := types.NewJID("15551234567", types.DefaultUserServer)
+	lid := types.NewJID("999123456789", types.HiddenUserServer)
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+
+	if err := db.UpsertChat(pn.String(), "dm", "Message Yourself", now.Add(-time.Minute)); err != nil {
+		t.Fatalf("UpsertChat inbound: %v", err)
+	}
+	if err := db.UpsertMessage(store.UpsertMessageParams{
+		ChatJID:   pn.String(),
+		MsgID:     "inbound-id",
+		Timestamp: now.Add(-time.Minute),
+		Text:      "from phone",
+	}); err != nil {
+		t.Fatalf("UpsertMessage inbound: %v", err)
+	}
+
+	persistOutboundTextWith(context.Background(), db, outboundTextResolverStub{lid: lid, pn: pn}, lid, "outbound-id", "self-test", now)
+
+	stored, err := db.GetMessage(pn.String(), "outbound-id")
+	if err != nil {
+		t.Fatalf("GetMessage PN outbound: %v", err)
+	}
+	if stored.ChatJID != pn.String() || !stored.FromMe || stored.Text != "self-test" {
+		t.Fatalf("stored outbound = %+v", stored)
+	}
+	chats, err := db.ListChats("", 10)
+	if err != nil {
+		t.Fatalf("ListChats: %v", err)
+	}
+	if len(chats) != 1 || chats[0].JID != pn.String() {
+		t.Fatalf("chats = %+v, want only canonical PN %s", chats, pn)
 	}
 }
 
@@ -295,6 +418,358 @@ func TestBuildReplyContextInfo(t *testing.T) {
 	}
 	if got != nil {
 		t.Fatalf("empty reply context = %v, want nil", got)
+	}
+}
+
+func TestBuildTextReplyContextInfo(t *testing.T) {
+	self := "15550000000@s.whatsapp.net"
+	tests := []struct {
+		name        string
+		chat        types.JID
+		fromMe      bool
+		senderJID   string
+		participant string
+	}{
+		{
+			name:        "direct incoming",
+			chat:        types.JID{User: "15551234567", Server: types.DefaultUserServer},
+			senderJID:   "15551234567@s.whatsapp.net",
+			participant: "15551234567@s.whatsapp.net",
+		},
+		{
+			name:        "group incoming",
+			chat:        types.JID{User: "12345", Server: types.GroupServer},
+			senderJID:   "15551234567@s.whatsapp.net",
+			participant: "15551234567@s.whatsapp.net",
+		},
+		{
+			name:        "direct outgoing",
+			chat:        types.JID{User: "15551234567", Server: types.DefaultUserServer},
+			fromMe:      true,
+			participant: self,
+		},
+		{
+			name:        "group outgoing",
+			chat:        types.JID{User: "12345", Server: types.GroupServer},
+			fromMe:      true,
+			participant: self,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openSendTestDB(t)
+			if err := db.UpsertChat(tc.chat.String(), "chat", tc.name, time.Now()); err != nil {
+				t.Fatalf("UpsertChat: %v", err)
+			}
+			if err := db.UpsertMessage(store.UpsertMessageParams{
+				ChatJID:   tc.chat.String(),
+				MsgID:     "quoted",
+				SenderJID: tc.senderJID,
+				Timestamp: time.Now(),
+				FromMe:    tc.fromMe,
+				Text:      "quoted text",
+			}); err != nil {
+				t.Fatalf("UpsertMessage: %v", err)
+			}
+
+			got, err := buildTextReplyContextInfo(db, tc.chat, types.EmptyJID, "quoted", "", self)
+			if err != nil {
+				t.Fatalf("buildTextReplyContextInfo: %v", err)
+			}
+			if got.GetStanzaID() != "quoted" {
+				t.Fatalf("stanza ID = %q, want quoted", got.GetStanzaID())
+			}
+			if got.GetParticipant() != tc.participant {
+				t.Fatalf("participant = %q, want %q", got.GetParticipant(), tc.participant)
+			}
+			if got.GetQuotedMessage().GetConversation() != "quoted text" {
+				t.Fatalf("quoted text = %q", got.GetQuotedMessage().GetConversation())
+			}
+		})
+	}
+}
+
+func TestSendTextMessageRejectsUnconstructableQuotesBeforeSending(t *testing.T) {
+	tests := []struct {
+		name      string
+		seed      func(*testing.T, *store.DB, types.JID)
+		wantError string
+	}{
+		{
+			name:      "missing row",
+			wantError: "not found in local store",
+		},
+		{
+			name: "unsupported media type",
+			seed: func(t *testing.T, db *store.DB, chat types.JID) {
+				t.Helper()
+				if err := db.UpsertMessage(store.UpsertMessageParams{
+					ChatJID:   chat.String(),
+					MsgID:     "quoted",
+					SenderJID: chat.String(),
+					Timestamp: time.Now(),
+					MediaType: "location",
+				}); err != nil {
+					t.Fatalf("UpsertMessage: %v", err)
+				}
+			},
+			wantError: "unsupported stored media type",
+		},
+		{
+			name: "incomplete document metadata",
+			seed: func(t *testing.T, db *store.DB, chat types.JID) {
+				t.Helper()
+				if err := db.UpsertMessage(store.UpsertMessageParams{
+					ChatJID:   chat.String(),
+					MsgID:     "quoted",
+					SenderJID: chat.String(),
+					Timestamp: time.Now(),
+					MediaType: "document",
+					Filename:  "incomplete.pdf",
+					MimeType:  "application/pdf",
+				}); err != nil {
+					t.Fatalf("UpsertMessage: %v", err)
+				}
+			},
+			wantError: "incomplete media metadata",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openSendTestDB(t)
+			chat := types.JID{User: "15551234567", Server: types.DefaultUserServer}
+			if err := db.UpsertChat(chat.String(), "dm", "Alice", time.Now()); err != nil {
+				t.Fatalf("UpsertChat: %v", err)
+			}
+			if tc.seed != nil {
+				tc.seed(t, db, chat)
+			}
+			sender := &recordingTextSender{linkedJID: "15550000000@s.whatsapp.net"}
+
+			_, err := sendTextMessageWithSender(context.Background(), sender, db, chat, "reply", "quoted", "", nil, nil, textEphemeralOptions{})
+			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("error = %v, want %q", err, tc.wantError)
+			}
+			if sender.textCalls != 0 || sender.protoCalls != 0 {
+				t.Fatalf("calls: SendText=%d SendProtoMessage=%d, want 0/0", sender.textCalls, sender.protoCalls)
+			}
+		})
+	}
+}
+
+func TestSendTextMessageQuotesStoredDocument(t *testing.T) {
+	db := openSendTestDB(t)
+	chat := types.JID{User: "15551234567", Server: types.DefaultUserServer}
+	if err := db.UpsertChat(chat.String(), "dm", "Alice", time.Now()); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	if err := db.UpsertMessage(store.UpsertMessageParams{
+		ChatJID:       chat.String(),
+		MsgID:         "quoted-document",
+		Timestamp:     time.Now(),
+		FromMe:        true,
+		MediaType:     "document",
+		MediaCaption:  "test document",
+		Filename:      "test.pdf",
+		MimeType:      "application/pdf",
+		DirectPath:    "/v/t62/test-document",
+		MediaKey:      []byte("media-key"),
+		FileSHA256:    []byte("plain-hash"),
+		FileEncSHA256: []byte("encrypted-hash"),
+		FileLength:    1234,
+	}); err != nil {
+		t.Fatalf("UpsertMessage: %v", err)
+	}
+	sender := &recordingTextSender{linkedJID: "15550000000@s.whatsapp.net"}
+
+	_, err := sendTextMessageWithSender(context.Background(), sender, db, chat, "reply", "quoted-document", "15550000000@s.whatsapp.net", nil, nil, textEphemeralOptions{})
+	if err != nil {
+		t.Fatalf("sendTextMessageWithSender: %v", err)
+	}
+	info := requireExtendedText(t, sender.protoMsg).GetContextInfo()
+	if info.GetStanzaID() != "quoted-document" {
+		t.Fatalf("stanza ID = %q, want quoted-document", info.GetStanzaID())
+	}
+	if info.GetParticipant() != "15550000000@s.whatsapp.net" {
+		t.Fatalf("participant = %q", info.GetParticipant())
+	}
+	doc := info.GetQuotedMessage().GetDocumentMessage()
+	if doc == nil {
+		t.Fatal("quoted document message is nil")
+	}
+	if doc.GetFileName() != "test.pdf" || doc.GetTitle() != "test.pdf" || doc.GetMimetype() != "application/pdf" {
+		t.Fatalf("quoted document identity: filename=%q title=%q mime=%q", doc.GetFileName(), doc.GetTitle(), doc.GetMimetype())
+	}
+	if doc.GetCaption() != "test document" || doc.GetDirectPath() != "/v/t62/test-document" || doc.GetFileLength() != 1234 {
+		t.Fatalf("quoted document metadata: caption=%q direct_path=%q length=%d", doc.GetCaption(), doc.GetDirectPath(), doc.GetFileLength())
+	}
+	if string(doc.GetMediaKey()) != "media-key" || string(doc.GetFileSHA256()) != "plain-hash" || string(doc.GetFileEncSHA256()) != "encrypted-hash" {
+		t.Fatal("quoted document media hashes or key were not preserved")
+	}
+	if sender.textCalls != 0 || sender.protoCalls != 1 {
+		t.Fatalf("calls: SendText=%d SendProtoMessage=%d, want 0/1", sender.textCalls, sender.protoCalls)
+	}
+}
+
+func TestSendTextMessageReplySenderBypassesSelfLIDLookup(t *testing.T) {
+	db := openSendTestDB(t)
+	chat := types.JID{User: "12345", Server: types.GroupServer}
+	if err := db.UpsertChat(chat.String(), "group", "Group", time.Now()); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	if err := db.UpsertMessage(store.UpsertMessageParams{
+		ChatJID:   chat.String(),
+		MsgID:     "quoted",
+		Timestamp: time.Now(),
+		FromMe:    true,
+		Text:      "quoted text",
+	}); err != nil {
+		t.Fatalf("UpsertMessage: %v", err)
+	}
+	sender := &recordingTextSender{
+		linkedJID: "15550000000@s.whatsapp.net",
+		groupInfo: &types.GroupInfo{AddressingMode: types.AddressingModeLID},
+	}
+
+	_, err := sendTextMessageWithSender(context.Background(), sender, db, chat, "reply", "quoted", "15551234567:4@s.whatsapp.net", nil, nil, textEphemeralOptions{})
+	if err != nil {
+		t.Fatalf("sendTextMessageWithSender: %v", err)
+	}
+	info := requireExtendedText(t, sender.protoMsg).GetContextInfo()
+	if got := info.GetParticipant(); got != "15551234567@s.whatsapp.net" {
+		t.Fatalf("participant = %q", got)
+	}
+	if sender.groupInfoCalls != 0 || sender.resolveLIDCalls != 0 {
+		t.Fatalf("identity calls: GetGroupInfo=%d ResolvePNToLID=%d, want 0/0", sender.groupInfoCalls, sender.resolveLIDCalls)
+	}
+}
+
+func TestSendTextMessageAllowsUnsyncedGroupReplyWithSender(t *testing.T) {
+	db := openSendTestDB(t)
+	chat := types.JID{User: "12345", Server: types.GroupServer}
+	sender := &recordingTextSender{linkedJID: "15550000000@s.whatsapp.net"}
+
+	_, err := sendTextMessageWithSender(context.Background(), sender, db, chat, "reply", "quoted", "+15551234567", nil, nil, textEphemeralOptions{})
+	if err != nil {
+		t.Fatalf("sendTextMessageWithSender: %v", err)
+	}
+	if sender.protoCalls != 1 || sender.textCalls != 0 {
+		t.Fatalf("calls: SendText=%d SendProtoMessage=%d, want 0/1", sender.textCalls, sender.protoCalls)
+	}
+	info := requireExtendedText(t, sender.protoMsg).GetContextInfo()
+	if info.GetStanzaID() != "quoted" {
+		t.Fatalf("stanza ID = %q, want quoted", info.GetStanzaID())
+	}
+	if info.GetParticipant() != "15551234567@s.whatsapp.net" {
+		t.Fatalf("participant = %q", info.GetParticipant())
+	}
+	if info.GetQuotedMessage() != nil {
+		t.Fatalf("quoted message = %v, want nil without stored content", info.GetQuotedMessage())
+	}
+}
+
+func TestSendTextMessageUsesLinkedLIDForOutgoingQuoteInLIDGroup(t *testing.T) {
+	db := openSendTestDB(t)
+	chat := types.JID{User: "12345", Server: types.GroupServer}
+	if err := db.UpsertChat(chat.String(), "group", "Group", time.Now()); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	if err := db.UpsertMessage(store.UpsertMessageParams{
+		ChatJID:   chat.String(),
+		MsgID:     "quoted",
+		Timestamp: time.Now(),
+		FromMe:    true,
+		Text:      "quoted text",
+	}); err != nil {
+		t.Fatalf("UpsertMessage: %v", err)
+	}
+	sender := &recordingTextSender{
+		linkedJID: "15550000000@s.whatsapp.net",
+		linkedLID: types.JID{User: "987654321", Server: types.HiddenUserServer},
+		groupInfo: &types.GroupInfo{AddressingMode: types.AddressingModeLID},
+	}
+
+	_, err := sendTextMessageWithSender(context.Background(), sender, db, chat, "reply", "quoted", "", nil, nil, textEphemeralOptions{})
+	if err != nil {
+		t.Fatalf("sendTextMessageWithSender: %v", err)
+	}
+	info := requireExtendedText(t, sender.protoMsg).GetContextInfo()
+	if got := info.GetParticipant(); got != sender.linkedLID.String() {
+		t.Fatalf("participant = %q, want %q", got, sender.linkedLID.String())
+	}
+	if sender.groupInfoCalls != 1 || sender.resolveLIDCalls != 1 {
+		t.Fatalf("identity calls: GetGroupInfo=%d ResolvePNToLID=%d, want 1/1", sender.groupInfoCalls, sender.resolveLIDCalls)
+	}
+}
+
+func TestSendTextMessageKeepsStoredSenderForIncomingQuoteInLIDGroup(t *testing.T) {
+	db := openSendTestDB(t)
+	chat := types.JID{User: "12345", Server: types.GroupServer}
+	senderJID := "987654321:4@lid"
+	wantSenderJID := "987654321@lid"
+	if err := db.UpsertChat(chat.String(), "group", "Group", time.Now()); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	if err := db.UpsertMessage(store.UpsertMessageParams{
+		ChatJID:   chat.String(),
+		MsgID:     "quoted",
+		SenderJID: senderJID,
+		Timestamp: time.Now(),
+		Text:      "quoted text",
+	}); err != nil {
+		t.Fatalf("UpsertMessage: %v", err)
+	}
+	sender := &recordingTextSender{
+		linkedJID: "15550000000@s.whatsapp.net",
+		linkedLID: types.JID{User: "123456789", Server: types.HiddenUserServer},
+		groupInfo: &types.GroupInfo{AddressingMode: types.AddressingModeLID},
+	}
+
+	_, err := sendTextMessageWithSender(context.Background(), sender, db, chat, "reply", "quoted", "", nil, nil, textEphemeralOptions{})
+	if err != nil {
+		t.Fatalf("sendTextMessageWithSender: %v", err)
+	}
+	info := requireExtendedText(t, sender.protoMsg).GetContextInfo()
+	if got := info.GetParticipant(); got != wantSenderJID {
+		t.Fatalf("participant = %q, want %q", got, wantSenderJID)
+	}
+	if sender.groupInfoCalls != 0 || sender.resolveLIDCalls != 0 {
+		t.Fatalf("identity calls: GetGroupInfo=%d ResolvePNToLID=%d, want 0/0", sender.groupInfoCalls, sender.resolveLIDCalls)
+	}
+}
+
+func TestSendTextMessageUsesLinkedLIDForOutgoingQuoteInLIDChat(t *testing.T) {
+	db := openSendTestDB(t)
+	chat := types.JID{User: "987654321", Server: types.HiddenUserServer}
+	if err := db.UpsertChat(chat.String(), "dm", "Alice", time.Now()); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	if err := db.UpsertMessage(store.UpsertMessageParams{
+		ChatJID:   chat.String(),
+		MsgID:     "quoted",
+		Timestamp: time.Now(),
+		FromMe:    true,
+		Text:      "quoted text",
+	}); err != nil {
+		t.Fatalf("UpsertMessage: %v", err)
+	}
+	sender := &recordingTextSender{
+		linkedJID: "15550000000@s.whatsapp.net",
+		linkedLID: types.JID{User: "123456789", Server: types.HiddenUserServer},
+	}
+
+	_, err := sendTextMessageWithSender(context.Background(), sender, db, chat, "reply", "quoted", "", nil, nil, textEphemeralOptions{})
+	if err != nil {
+		t.Fatalf("sendTextMessageWithSender: %v", err)
+	}
+	info := requireExtendedText(t, sender.protoMsg).GetContextInfo()
+	if got := info.GetParticipant(); got != sender.linkedLID.String() {
+		t.Fatalf("participant = %q, want %q", got, sender.linkedLID.String())
+	}
+	if sender.groupInfoCalls != 0 || sender.resolveLIDCalls != 1 {
+		t.Fatalf("identity calls: GetGroupInfo=%d ResolvePNToLID=%d, want 0/1", sender.groupInfoCalls, sender.resolveLIDCalls)
 	}
 }
 
@@ -587,6 +1062,18 @@ func TestValidateTextEphemeralOptionsRejectsZeroDuration(t *testing.T) {
 func TestBuildTextMessageCombinesReplyAndMentions(t *testing.T) {
 	db := openSendTestDB(t)
 	chat := types.JID{User: "12345", Server: types.GroupServer}
+	if err := db.UpsertChat(chat.String(), "group", "Group", time.Now()); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	if err := db.UpsertMessage(store.UpsertMessageParams{
+		ChatJID:   chat.String(),
+		MsgID:     "quoted",
+		SenderJID: "15557654321@s.whatsapp.net",
+		Timestamp: time.Now(),
+		Text:      "quoted text",
+	}); err != nil {
+		t.Fatalf("UpsertMessage: %v", err)
+	}
 
 	msg, plain, err := buildTextMessage(db, chat, "replying @15551234567", "quoted", "+15557654321", nil, []string{"15551234567@s.whatsapp.net"})
 	if err != nil {
@@ -601,6 +1088,9 @@ func TestBuildTextMessageCombinesReplyAndMentions(t *testing.T) {
 	}
 	if info.GetParticipant() != "15557654321@s.whatsapp.net" {
 		t.Fatalf("participant = %q", info.GetParticipant())
+	}
+	if info.GetQuotedMessage().GetConversation() != "quoted text" {
+		t.Fatalf("quoted text = %q", info.GetQuotedMessage().GetConversation())
 	}
 	if got := info.GetMentionedJID(); strings.Join(got, ",") != "15551234567@s.whatsapp.net" {
 		t.Fatalf("mentioned JIDs = %v", got)
@@ -642,5 +1132,97 @@ func TestBuildTextMessageAttachesLinkPreview(t *testing.T) {
 	}
 	if string(ext.GetJPEGThumbnail()) != "jpeg" {
 		t.Fatalf("thumbnail = %q", string(ext.GetJPEGThumbnail()))
+	}
+}
+
+func TestBuildTextReplyContextInfoFindsQuoteUnderChatAlias(t *testing.T) {
+	pn := types.NewJID("51918505715", types.DefaultUserServer)
+	lid := types.NewJID("46922702278894", types.HiddenUserServer)
+
+	tests := []struct {
+		name      string
+		storedIn  types.JID
+		addressed types.JID
+	}{
+		{name: "history under phone JID, addressed by LID", storedIn: pn, addressed: lid},
+		{name: "history under LID, addressed by phone JID", storedIn: lid, addressed: pn},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openSendTestDB(t)
+			if err := db.UpsertChat(tc.storedIn.String(), "chat", "alias chat", time.Now()); err != nil {
+				t.Fatalf("UpsertChat: %v", err)
+			}
+			if err := db.UpsertMessage(store.UpsertMessageParams{
+				ChatJID:   tc.storedIn.String(),
+				MsgID:     "quoted",
+				SenderJID: tc.storedIn.String(),
+				Timestamp: time.Now(),
+				Text:      "original",
+			}); err != nil {
+				t.Fatalf("UpsertMessage: %v", err)
+			}
+
+			if _, err := buildTextReplyContextInfo(db, tc.addressed, types.EmptyJID, "quoted", "", ""); err == nil {
+				t.Fatal("expected the un-aliased lookup to fail")
+			}
+
+			got, err := buildTextReplyContextInfo(db, tc.addressed, tc.storedIn, "quoted", "", "")
+			if err != nil {
+				t.Fatalf("alias lookup should resolve the quote: %v", err)
+			}
+			if got == nil || got.GetStanzaID() != "quoted" {
+				t.Fatalf("context info = %+v, want StanzaID=quoted", got)
+			}
+			if got.GetParticipant() != tc.storedIn.String() {
+				t.Fatalf("participant = %q, want %q", got.GetParticipant(), tc.storedIn.String())
+			}
+		})
+	}
+}
+
+func TestSendTextReplyToOwnMessageUnderChatAliasUsesLIDParticipant(t *testing.T) {
+	db := openSendTestDB(t)
+	pn := types.NewJID("51918505715", types.DefaultUserServer)
+	lid := types.NewJID("46922702278894", types.HiddenUserServer)
+	linkedPN := types.NewJID("15550000000", types.DefaultUserServer)
+	linkedLID := types.NewJID("99887766554433", types.HiddenUserServer)
+
+	if err := db.UpsertChat(pn.String(), "dm", "Alice", time.Now()); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	if err := db.UpsertMessage(store.UpsertMessageParams{
+		ChatJID:   pn.String(),
+		MsgID:     "quoted",
+		Timestamp: time.Now(),
+		FromMe:    true,
+		Text:      "my earlier message",
+	}); err != nil {
+		t.Fatalf("UpsertMessage: %v", err)
+	}
+
+	sender := &recordingTextSender{
+		linkedJID: linkedPN.String(),
+		linkedLID: linkedLID,
+		lidToPN:   pn,
+	}
+
+	if _, err := sendTextMessageWithSender(context.Background(), sender, db, lid, "reply", "quoted", "", nil, nil, textEphemeralOptions{}); err != nil {
+		t.Fatalf("sendTextMessageWithSender: %v", err)
+	}
+
+	if sender.protoMsg == nil {
+		t.Fatal("no proto message sent")
+	}
+	ctxInfo := sender.protoMsg.GetExtendedTextMessage().GetContextInfo()
+	if ctxInfo == nil {
+		t.Fatal("no context info on the sent message")
+	}
+	if ctxInfo.GetStanzaID() != "quoted" {
+		t.Fatalf("stanza ID = %q, want quoted", ctxInfo.GetStanzaID())
+	}
+	if ctxInfo.GetParticipant() != linkedLID.String() {
+		t.Fatalf("participant = %q, want the linked LID %q", ctxInfo.GetParticipant(), linkedLID.String())
 	}
 }

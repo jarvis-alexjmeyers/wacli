@@ -142,7 +142,7 @@ func (d *DB) ListMessageChanges(afterSeq int64, limit int) (MessageChangesPage, 
 			COALESCE(m.media_type,''), COALESCE(m.media_caption,''), COALESCE(m.filename,''), COALESCE(m.mime_type,''),
 			COALESCE(m.direct_path,''), COALESCE(m.local_path,''), COALESCE(m.downloaded_at,0),
 			CASE WHEN s.msg_id IS NULL THEN 0 ELSE 1 END, COALESCE(s.starred_at,0),
-			COALESCE(m.revoked,0), COALESCE(m.deleted_for_me,0), COALESCE(m.buttons,''), ''
+			COALESCE(m.revoked,0), COALESCE(m.deleted_for_me,0), COALESCE(m.deleted_at,0), COALESCE(m.deletion_reason,''), COALESCE(m.payload_purged_at,0), COALESCE(m.edited,0), COALESCE(m.buttons,''), ''
 		FROM message_changes mc
 		LEFT JOIN messages m ON m.chat_jid = mc.chat_jid AND m.msg_id = mc.msg_id
 		LEFT JOIN chats c ON c.jid = m.chat_jid
@@ -204,6 +204,10 @@ func scanMessageChange(rows *sql.Rows) (MessageChange, bool, Message, error) {
 	var snippet string
 	var mentionsMe sql.NullInt64
 	var repliesToMe sql.NullInt64
+	var deletedAt int64
+	var deletionReason string
+	var payloadPurgedAt int64
+	var edited int64
 	err := rows.Scan(
 		&change.Seq, &change.Kind, &change.Origin, &change.ChatJID, &change.MsgID, &change.TS, &changeFromMe,
 		&present,
@@ -211,6 +215,7 @@ func scanMessageChange(rows *sql.Rows) (MessageChange, bool, Message, error) {
 		&m.Text, &m.DisplayText, &m.QuotedMsgID, &m.QuotedSenderJID, &mentionsMe, &repliesToMe, &forwarded, &forwardingScore,
 		&m.ReactionToID, &m.ReactionEmoji, &m.MediaType, &m.MediaCaption, &m.Filename, &m.MimeType,
 		&m.DirectPath, &m.LocalPath, &downloadedAt, &starred, &starredAt, &revoked, &deletedForMe,
+		&deletedAt, &deletionReason, &payloadPurgedAt, &edited,
 		&buttonsJSON, &snippet,
 	)
 	if err != nil {
@@ -222,7 +227,7 @@ func scanMessageChange(rows *sql.Rows) (MessageChange, bool, Message, error) {
 		ts, int64(fromMe), m.Text, m.DisplayText, m.QuotedMsgID, m.QuotedSenderJID,
 		mentionsMe, repliesToMe, int64(forwarded), forwardingScore, m.ReactionToID, m.ReactionEmoji, m.MediaType,
 		m.MediaCaption, m.Filename, m.MimeType, m.DirectPath, m.LocalPath,
-		downloadedAt, int64(starred), starredAt, int64(revoked), int64(deletedForMe), buttonsJSON, snippet,
+		downloadedAt, int64(starred), starredAt, int64(revoked), int64(deletedForMe), deletedAt, deletionReason, payloadPurgedAt, edited, buttonsJSON, snippet,
 	)
 	return change, present != 0, m, nil
 }

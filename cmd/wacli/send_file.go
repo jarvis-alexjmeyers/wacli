@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -11,6 +12,7 @@ import (
 	_ "image/gif"
 	"image/jpeg"
 	_ "image/png"
+	"io"
 	"math"
 	"mime"
 	"net/http"
@@ -35,10 +37,13 @@ const imageThumbnailMaxPixels = 40_000_000
 const voiceWaveformSamples = 64
 const voiceWaveformMax = 100
 
+const sendMediaTypeAuto = "auto"
+
 type sendFileOptions struct {
 	filename      string
 	caption       string
 	mimeOverride  string
+	mediaAs       string
 	replyTo       string
 	replyToSender string
 	ptt           bool
@@ -49,13 +54,30 @@ type voiceNoteMetadata struct {
 	waveform []byte
 }
 
+// sendFileOutcome is the result of a completed file send. storeWarning is
+// non-nil when WhatsApp accepted the message but recording it in local
+// history failed; callers must surface the warning without discarding the
+// delivered ID, since reporting a hard error would invite automation to
+// retry an already-delivered message.
+type sendFileOutcome struct {
+	id           string
+	meta         map[string]string
+	storeWarning error
+}
+
 func sendFile(ctx context.Context, a interface {
 	WA() app.WAClient
 	DB() *store.DB
-}, to types.JID, filePath string, opts sendFileOptions) (string, map[string]string, error) {
+}, to types.JID, filePath string, opts sendFileOptions) (sendFileOutcome, error) {
+	mediaAs, err := validateSendFileMediaOptions(opts.mediaAs, opts.ptt)
+	if err != nil {
+		return sendFileOutcome{}, err
+	}
+	opts.mediaAs = mediaAs
+
 	data, err := readSendFileData(filePath)
 	if err != nil {
-		return "", nil, err
+		return sendFileOutcome{}, err
 	}
 
 	name := strings.TrimSpace(opts.filename)
@@ -64,29 +86,20 @@ func sendFile(ctx context.Context, a interface {
 	}
 	mimeType := detectSendFileMIME(filePath, opts.mimeOverride, data)
 	if opts.ptt && !isOggOpusMIME(mimeType) {
-		return "", nil, fmt.Errorf("voice notes require OGG Opus audio; got %s", mimeType)
+		return sendFileOutcome{}, fmt.Errorf("voice notes require OGG Opus audio; got %s", mimeType)
 	}
 
-	mediaType := "document"
-	uploadType, _ := wa.MediaTypeFromString("document")
-	switch {
-	case strings.HasPrefix(mimeType, "image/"):
-		mediaType = "image"
-		uploadType, _ = wa.MediaTypeFromString("image")
-	case strings.HasPrefix(mimeType, "video/"):
-		mediaType = "video"
-		uploadType, _ = wa.MediaTypeFromString("video")
-	case strings.HasPrefix(mimeType, "audio/"):
-		mediaType = "audio"
-		uploadType, _ = wa.MediaTypeFromString("audio")
+	mediaType, uploadType, err := resolveSendMediaType(mimeType, opts.mediaAs)
+	if err != nil {
+		return sendFileOutcome{}, err
 	}
 
 	isNewsletter := to.Server == types.NewsletterServer
 	if isNewsletter && opts.ptt {
-		return "", nil, fmt.Errorf("voice-note mode is not supported for channels; omit --ptt to send audio")
+		return sendFileOutcome{}, fmt.Errorf("voice-note mode is not supported for channels; omit --ptt to send audio")
 	}
 	if isNewsletter && (strings.TrimSpace(opts.replyTo) != "" || strings.TrimSpace(opts.replyToSender) != "") {
-		return "", nil, fmt.Errorf("quoted file replies are not supported for channels")
+		return sendFileOutcome{}, fmt.Errorf("quoted file replies are not supported for channels")
 	}
 
 	var up whatsmeow.UploadResponse
@@ -96,7 +109,7 @@ func sendFile(ctx context.Context, a interface {
 		up, err = a.WA().Upload(ctx, data, uploadType)
 	}
 	if err != nil {
-		return "", nil, err
+		return sendFileOutcome{}, err
 	}
 
 	now := time.Now().UTC()
@@ -105,7 +118,7 @@ func sendFile(ctx context.Context, a interface {
 	if !isNewsletter {
 		replyContext, err = buildReplyContextInfo(a.DB(), to, opts.replyTo, opts.replyToSender)
 		if err != nil {
-			return "", nil, err
+			return sendFileOutcome{}, err
 		}
 	}
 	voiceMeta := voiceNoteMetadata{}
@@ -117,7 +130,7 @@ func sendFile(ctx context.Context, a interface {
 	case "image":
 		imageMsg, err := newImageMessage(up, mimeType, opts.caption, data)
 		if err != nil {
-			return "", nil, err
+			return sendFileOutcome{}, err
 		}
 		msg.ImageMessage = imageMsg
 	case "video":
@@ -156,11 +169,15 @@ func sendFile(ctx context.Context, a interface {
 		id, err = a.WA().SendProtoMessage(ctx, to, msg)
 	}
 	if err != nil {
-		return "", nil, err
+		return sendFileOutcome{}, err
 	}
 
+	// The send already succeeded; store failures below surface as a warning
+	// on the outcome instead of an error so history divergence is visible
+	// without turning a delivered message into a reported failure.
+	var storeErr error
 	if to == types.StatusBroadcastJID {
-		_ = a.DB().UpsertStatusMessage(store.UpsertStatusMessageParams{
+		storeErr = a.DB().UpsertStatusMessage(store.UpsertStatusMessageParams{
 			MsgID:         id,
 			Timestamp:     now,
 			FromMe:        true,
@@ -179,8 +196,10 @@ func sendFile(ctx context.Context, a interface {
 	} else {
 		chatName := a.WA().ResolveChatName(ctx, to, "")
 		kind := chatKindFromJID(to)
-		_ = a.DB().UpsertChat(to.String(), kind, chatName, now)
-		_ = a.DB().UpsertMessage(store.UpsertMessageParams{
+		if err := a.DB().UpsertChat(to.String(), kind, chatName, now); err != nil {
+			storeErr = fmt.Errorf("chat update: %w", err)
+		}
+		if err := a.DB().UpsertMessage(store.UpsertMessageParams{
 			ChatJID:       to.String(),
 			ChatName:      chatName,
 			MsgID:         id,
@@ -198,15 +217,101 @@ func sendFile(ctx context.Context, a interface {
 			FileSHA256:    up.FileSHA256,
 			FileEncSHA256: up.FileEncSHA256,
 			FileLength:    up.FileLength,
-		})
+		}); err != nil {
+			storeErr = errors.Join(storeErr, fmt.Errorf("message update: %w", err))
+		}
 	}
 
-	return id, map[string]string{
-		"name":      name,
-		"mime_type": mimeType,
-		"media":     mediaType,
-		"ptt":       strconv.FormatBool(opts.ptt),
+	return sendFileOutcome{
+		id: id,
+		meta: map[string]string{
+			"name":      name,
+			"mime_type": mimeType,
+			"media":     mediaType,
+			"ptt":       strconv.FormatBool(opts.ptt),
+		},
+		storeWarning: storeErr,
 	}, nil
+}
+
+// warnSendStoreFailure reports a post-delivery local-history failure on the
+// human channel. Kept alongside sendFileOutcome so every caller phrases the
+// partial success the same way.
+func warnSendStoreFailure(w io.Writer, id string, storeWarning error) {
+	if storeWarning == nil {
+		return
+	}
+	warnSendStoreFailureMsg(w, id, storeWarning.Error())
+}
+
+// warnSendStoreFailureMsg is the string form for callers that receive the
+// warning across the IPC boundary.
+func warnSendStoreFailureMsg(w io.Writer, id, msg string) {
+	if msg == "" {
+		return
+	}
+	fmt.Fprintf(w, "warning: message delivered (id %s) but local history update failed: %s\n", id, msg)
+}
+
+// addStoreWarning annotates a JSON success payload with the partial-success
+// marker; absent key means local history was written.
+func addStoreWarning(payload map[string]any, storeWarning error) map[string]any {
+	if storeWarning != nil {
+		payload["store_warning"] = storeWarning.Error()
+	}
+	return payload
+}
+
+// resolveSendMediaType decides the WhatsApp message type (and matching upload
+// type) for an outbound file. By default it derives the type from the MIME
+// prefix. A non-empty override other than "auto" (from --as) forces the type,
+// so a caller can, e.g., send an mp3 as a downloadable document instead of an
+// inline audio bubble — WhatsApp derives the bubble from the message type, not
+// the MIME. Only document/audio/image/video may be forced.
+func resolveSendMediaType(mimeType, override string) (string, whatsmeow.MediaType, error) {
+	as, err := normalizeSendMediaTypeOverride(override)
+	if err != nil {
+		return "", "", err
+	}
+	if as != sendMediaTypeAuto {
+		ut, _ := wa.MediaTypeFromString(as)
+		return as, ut, nil
+	}
+	switch {
+	case strings.HasPrefix(mimeType, "image/"):
+		ut, _ := wa.MediaTypeFromString("image")
+		return "image", ut, nil
+	case strings.HasPrefix(mimeType, "video/"):
+		ut, _ := wa.MediaTypeFromString("video")
+		return "video", ut, nil
+	case strings.HasPrefix(mimeType, "audio/"):
+		ut, _ := wa.MediaTypeFromString("audio")
+		return "audio", ut, nil
+	}
+	ut, _ := wa.MediaTypeFromString("document")
+	return "document", ut, nil
+}
+
+func validateSendFileMediaOptions(override string, ptt bool) (string, error) {
+	as, err := normalizeSendMediaTypeOverride(override)
+	if err != nil {
+		return "", err
+	}
+	if ptt && as != sendMediaTypeAuto && as != "audio" {
+		return "", fmt.Errorf("--ptt may only be used with --as auto or --as audio")
+	}
+	return as, nil
+}
+
+func normalizeSendMediaTypeOverride(override string) (string, error) {
+	switch as := strings.ToLower(strings.TrimSpace(override)); as {
+	case "", sendMediaTypeAuto:
+		return sendMediaTypeAuto, nil
+	case "document", "audio", "image", "video":
+		return as, nil
+	default:
+		return "", fmt.Errorf("invalid --as %q (want auto|document|audio|image|video)", override)
+	}
 }
 
 func newImageMessage(up whatsmeow.UploadResponse, mimeType, caption string, data []byte) (*waProto.ImageMessage, error) {

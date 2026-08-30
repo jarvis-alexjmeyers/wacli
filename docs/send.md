@@ -1,6 +1,6 @@
 # send
 
-Read when: sending text, files, stickers, polls, status broadcasts, quoted replies, or reactions.
+Read when: sending text, files, stickers, locations, polls, status broadcasts, quoted replies, or reactions.
 
 `wacli send` requires authentication, a live connection, and writable mode. Send attempts are bounded and retry once after reconnect for known stale-session/usync timeout failures. `Sent to ...` and JSON `sent: true` mean WhatsApp accepted the send request and returned a message ID; they do not confirm recipient delivery. After a successful send, wacli keeps the connection alive briefly so whatsmeow can handle retry receipts from devices that could not decrypt the first copy. Repeated send commands within 5 seconds print a stderr warning so tight loops make WhatsApp rate-limit/account-risk visible.
 
@@ -10,9 +10,10 @@ When `sync --follow` is already running for the same store, send commands delega
 
 ```bash
 wacli send text --to RECIPIENT --message TEXT [--message-escapes] [--pick N] [--mention USER] [--no-preview] [--ephemeral] [--ephemeral-duration DURATION] [--reply-to MSG_ID] [--reply-to-sender JID] [--post-send-wait 2s]
-wacli send file --to RECIPIENT --file PATH [--pick N] [--caption TEXT] [--filename NAME] [--mime TYPE] [--ptt] [--reply-to MSG_ID] [--reply-to-sender JID] [--post-send-wait 2s]
+wacli send file --to RECIPIENT --file PATH [--pick N] [--caption TEXT] [--filename NAME] [--mime TYPE] [--as auto|document|audio|image|video] [--ptt] [--reply-to MSG_ID] [--reply-to-sender JID] [--post-send-wait 2s]
 wacli send sticker --to RECIPIENT --file PATH [--pick N] [--reply-to MSG_ID] [--reply-to-sender JID] [--post-send-wait 2s]
 wacli send voice --to RECIPIENT --file PATH [--pick N] [--mime TYPE] [--reply-to MSG_ID] [--reply-to-sender JID] [--post-send-wait 2s]
+wacli send location --to RECIPIENT --latitude LAT --longitude LNG [--name TEXT] [--pick N] [--post-send-wait 2s]
 wacli send react --to PHONE_OR_JID --id MSG_ID [--reaction TEXT] [--sender JID] [--post-send-wait 2s]
 wacli send poll --to RECIPIENT --question TEXT --option TEXT --option TEXT [--multi N] [--ephemeral] [--post-send-wait 2s]
 wacli send status [--message TEXT] [--file PATH] [--mime TYPE] [--background-color '#RRGGBB'] [--font N] [--post-send-wait 2s]
@@ -24,11 +25,12 @@ wacli polls list [--chat RECIPIENT] [--limit N] [--json]
 
 ## Recipients
 
-- `send text`, `send file`, `send sticker`, and `send voice` accept a JID, phone number, or synced contact/group/chat name.
+- `send text`, `send file`, `send sticker`, `send voice`, and `send location` accept a JID, phone number, or synced contact/group/chat name.
 - Channel JIDs use `...@newsletter`; `send text` and `send file` can target channels when the authenticated account has posting permission.
 - If a name matches multiple recipients, interactive terminals prompt.
 - In scripts, use `--pick N` to choose a displayed match.
 - Phone numbers may use common formatting such as `+1 (234) 567-8900`.
+- `send text` rejects the linked account's own phone-number or LID target. WhatsApp may acknowledge these self-DMs without delivering them to Message Yourself, so wacli returns an explicit error instead of `sent: true`.
 
 ## Replies and reactions
 
@@ -38,13 +40,15 @@ wacli polls list [--chat RECIPIENT] [--limit N] [--json]
 - `--ephemeral` sends text with `ContextInfo.Expiration`, matching the disappearing-send path. For groups, wacli uses the live group timer when available; otherwise it falls back to a 7-day default. Set `--ephemeral-duration` to choose an explicit expiration.
 - `--message` is literal by default. Pass `--message-escapes` to interpret `\n`, `\r`, `\t`, `\\`, and `\"` before sending.
 - Use repeatable `--mention USER` with a phone number or user JID to add WhatsApp mentions to `send text`.
-- `--reply-to` quotes a stored message ID.
+- `send text --reply-to` reconstructs the stored text or supported media quote content (image, video/GIF, audio, document, or sticker); stored media must have complete sync metadata.
+- Other send commands use `--reply-to` to quote a stored message ID.
 - For unsynced group replies, pass `--reply-to-sender`.
 - `send react` defaults to thumbs-up.
 - Pass `--reaction ""` to clear a reaction.
 - Sent reactions are stored locally immediately, including reaction target and display text.
 - For group reactions, pass `--sender` for the original message sender.
 - Use `--post-send-wait 0` to disable the retry-receipt grace window for latency-sensitive scripts.
+- If any send command (text, file, voice, sticker, status, react, poll, poll vote, select, or message forward) delivers a message but recording it in local history fails (disk full, locked store), the command still succeeds with the delivered id and prints a warning to stderr; JSON output carries the failure in `store_warning`, including for sends delegated to a running `sync --follow` process. Do not retry such a send — the recipient already has the message.
 
 ## Polls
 
@@ -82,10 +86,21 @@ wacli polls list [--chat RECIPIENT] [--limit N] [--json]
 - Media statuses reuse the normal upload path, including MIME detection and `--mime` overrides.
 - Sent and synced statuses are stored in the local `status_messages` table, separate from normal chat `messages`.
 
+## Locations
+
+- `send location` sends a native WhatsApp location pin from decimal degrees.
+- `--latitude` and `--longitude` are both required and must be finite; latitude is bounded to -90..90 and longitude to -180..180. Both flags must be passed explicitly, because 0,0 is a real coordinate and cannot be distinguished from an omitted flag.
+- `--name` is optional and labels the pin; it is omitted from the message when empty.
+- A pin carries no caption, mentions, or quoted reply: `LocationMessage` has no field for them.
+- Received and sent pins are stored in the `message_locations` table (`chat_jid`, `msg_id`, `latitude`, `longitude`, `name`, `address`, `is_live`), and the message row records `media_type=location` with the display text `Sent location`. Live location shares are stored the same way with `is_live=1`.
+- Coordinates are removed by `messages purge` and by the chat cleanup commands, on the same terms as any other retained message payload. See [store](store.md).
+- Locations synced before this table existed have no coordinates and cannot be backfilled.
+
 ## Files
 
 - File uploads are capped at 100 MiB.
 - MIME type is detected automatically unless `--mime` is set.
+- WhatsApp derives the message bubble (image, video, audio, or document) from the message type, which wacli picks from the MIME by default. Use `--as auto|document|audio|image|video` to force it. For example, `--mime audio/mpeg --as document` delivers an mp3 as a downloadable document instead of an inline audio bubble, matching how the mobile app attaches files. `--as auto` (the default) keeps MIME-based detection. `--ptt` only accepts `--as auto` or `--as audio`.
 - `--filename` changes the displayed document name.
 - Captions apply to images, videos, and documents.
 - Files sent to channels use WhatsApp's unencrypted newsletter media upload path and include the upstream media handle required by `whatsmeow`.
@@ -110,6 +125,7 @@ wacli send file --to 1234567890 --file ./pic.jpg --caption "hi"
 wacli send file --to 1234567890 --file /tmp/report --filename report.pdf
 wacli send sticker --to 1234567890 --file ./sticker-512.webp
 wacli send voice --to 1234567890 --file ./voice.ogg
+wacli send location --to 1234567890 --latitude 51.4779 --longitude -0.0015 --name "Royal Observatory"
 wacli send react --to 1234567890 --id ABC123 --reaction "❤️"
 wacli send poll --to "Family" --question "Dinner?" --option "Pizza" --option "Sushi" --multi 1
 wacli send status --message "available today" --background-color '#1f7a8c' --font 1

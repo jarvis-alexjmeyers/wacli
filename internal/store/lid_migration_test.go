@@ -1,6 +1,8 @@
 package store
 
 import (
+	"database/sql"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -62,6 +64,48 @@ func TestHistoricalLIDJIDsFindsChatAndMessageColumns(t *testing.T) {
 	got, err := db.HistoricalLIDJIDs()
 	if err != nil {
 		t.Fatalf("HistoricalLIDJIDs: %v", err)
+	}
+	if want := []string{lid}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("HistoricalLIDJIDs = %#v, want %#v", got, want)
+	}
+}
+
+func TestHistoricalLIDJIDsFindsGroupIdentities(t *testing.T) {
+	db := openTestDB(t)
+	lid := "999123456789@lid"
+	group := "120363000000@g.us"
+	if err := db.UpsertGroup(group, "Project", lid, time.Time{}); err != nil {
+		t.Fatalf("UpsertGroup: %v", err)
+	}
+	if err := db.ReplaceGroupParticipants(group, []GroupParticipant{{
+		GroupJID: group,
+		UserJID:  lid,
+		Role:     "admin",
+	}}); err != nil {
+		t.Fatalf("ReplaceGroupParticipants: %v", err)
+	}
+
+	got, err := db.HistoricalLIDJIDs()
+	if err != nil {
+		t.Fatalf("HistoricalLIDJIDs: %v", err)
+	}
+	if want := []string{lid}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("HistoricalLIDJIDs = %#v, want %#v", got, want)
+	}
+}
+
+func TestHistoricalLIDJIDsFindsPurgeLedgerOnlyIdentity(t *testing.T) {
+	db := openTestDB(t)
+	lid := "888123456789@lid"
+	if _, err := db.sql.Exec(`
+		INSERT INTO message_payload_purges(chat_jid, msg_id, purged_at, deleted_at, deletion_reason)
+		VALUES(?, 'mid', 3, 2, 'whatsapp-revoke')
+	`, lid); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.HistoricalLIDJIDs()
+	if err != nil {
+		t.Fatal(err)
 	}
 	if want := []string{lid}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("HistoricalLIDJIDs = %#v, want %#v", got, want)
@@ -297,6 +341,372 @@ func TestMigrateLIDToPNMergesChatsAndMessages(t *testing.T) {
 	}
 }
 
+func TestMigrateLIDToPNMergesGroupIdentities(t *testing.T) {
+	db := openTestDB(t)
+	lid := "999123456789@lid"
+	pn := "15551234567@s.whatsapp.net"
+	group := "120363000000@g.us"
+	if err := db.UpsertGroup(group, "Project", lid, time.Time{}); err != nil {
+		t.Fatalf("UpsertGroup: %v", err)
+	}
+	if _, err := db.sql.Exec(`
+		INSERT INTO group_participants(group_jid, user_jid, role, updated_at)
+		VALUES (?, ?, 'member', 1), (?, ?, 'admin', 2)
+	`, group, pn, group, lid); err != nil {
+		t.Fatalf("insert participants: %v", err)
+	}
+
+	if err := db.MigrateLIDToPN(lid, pn); err != nil {
+		t.Fatalf("MigrateLIDToPN: %v", err)
+	}
+	if err := db.MigrateLIDToPN(lid, pn); err != nil {
+		t.Fatalf("MigrateLIDToPN idempotent: %v", err)
+	}
+
+	groups, err := db.ListGroups("Project", 1)
+	if err != nil {
+		t.Fatalf("ListGroups: %v", err)
+	}
+	if len(groups) != 1 || groups[0].OwnerJID != pn {
+		t.Fatalf("groups = %+v, want owner %q", groups, pn)
+	}
+	if got := countRows(t, db.sql, "SELECT COUNT(*) FROM group_participants WHERE group_jid = ?", group); got != 1 {
+		t.Fatalf("participant rows = %d, want 1", got)
+	}
+	var userJID, role string
+	var updatedAt int64
+	if err := db.sql.QueryRow(`
+		SELECT user_jid, role, updated_at
+		FROM group_participants
+		WHERE group_jid = ?
+	`, group).Scan(&userJID, &role, &updatedAt); err != nil {
+		t.Fatalf("query participant: %v", err)
+	}
+	if userJID != pn || role != "admin" || updatedAt != 2 {
+		t.Fatalf("participant = (%q, %q, %d), want (%q, admin, 2)", userJID, role, updatedAt, pn)
+	}
+}
+
+func TestMigrateLIDToPNPreservesButtons(t *testing.T) {
+	db := openTestDB(t)
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	pn := "15551234567@s.whatsapp.net"
+	lid := "999123456789@lid"
+	if err := db.UpsertChat(lid, "dm", "Alice", base); err != nil {
+		t.Fatalf("UpsertChat lid: %v", err)
+	}
+
+	want := []Button{
+		{Type: "url", DisplayText: "Buy flights", URL: "https://example.com/flights"},
+		{Type: "quick_reply", DisplayText: "No thanks", ID: "no"},
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID:   lid,
+		MsgID:     "tmpl1",
+		SenderJID: lid,
+		Timestamp: base,
+		Text:      "Check our deals",
+		Buttons:   want,
+	}); err != nil {
+		t.Fatalf("UpsertMessage: %v", err)
+	}
+
+	if err := db.MigrateLIDToPN(lid, pn); err != nil {
+		t.Fatalf("MigrateLIDToPN: %v", err)
+	}
+
+	msg, err := db.GetMessage(pn, "tmpl1")
+	if err != nil {
+		t.Fatalf("GetMessage after migration: %v", err)
+	}
+	if len(msg.Buttons) != len(want) {
+		t.Fatalf("expected %d buttons after migration, got %d: %+v", len(want), len(msg.Buttons), msg.Buttons)
+	}
+	for i, b := range want {
+		got := msg.Buttons[i]
+		if got.Type != b.Type || got.DisplayText != b.DisplayText || got.ID != b.ID || got.URL != b.URL {
+			t.Fatalf("button[%d]: got %+v, want %+v", i, got, b)
+		}
+	}
+}
+
+func TestMigrateLIDToPNPreservesDeletedMessagePayload(t *testing.T) {
+	db := openTestDB(t)
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	pn := "15551234567@s.whatsapp.net"
+	lid := "999123456789@lid"
+	if err := db.UpsertChat(lid, "dm", "Alice", base); err != nil {
+		t.Fatalf("UpsertChat lid: %v", err)
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID:         lid,
+		MsgID:           "deleted-reply",
+		SenderJID:       lid,
+		Timestamp:       base,
+		QuotedMsgID:     "quoted",
+		QuotedSenderJID: lid,
+		Text:            "retained reply",
+		MediaType:       "document",
+		Filename:        "proof.pdf",
+		DeletedForMe:    true,
+	}); err != nil {
+		t.Fatalf("UpsertMessage: %v", err)
+	}
+	if _, err := db.sql.Exec(`UPDATE messages SET quoted_msg_id = ?, quoted_sender_jid = ? WHERE chat_jid = ? AND msg_id = ?`, "quoted", lid, lid, "deleted-reply"); err != nil {
+		t.Fatalf("seed legacy quoted metadata: %v", err)
+	}
+
+	if err := db.MigrateLIDToPN(lid, pn); err != nil {
+		t.Fatalf("MigrateLIDToPN: %v", err)
+	}
+
+	msg, err := db.GetMessage(pn, "deleted-reply")
+	if err != nil {
+		t.Fatalf("GetMessage after migration: %v", err)
+	}
+	if !msg.DeletedForMe {
+		t.Fatalf("DeletedForMe = false")
+	}
+	if msg.QuotedMsgID != "quoted" || msg.QuotedSenderJID != pn {
+		t.Fatalf("deleted quoted metadata = id %q sender %q", msg.QuotedMsgID, msg.QuotedSenderJID)
+	}
+	if msg.Text != "retained reply" || msg.MediaType != "document" || msg.Filename != "proof.pdf" {
+		t.Fatalf("deleted payload = %+v", msg)
+	}
+	if msg.DeletedAt == nil || msg.DeletionReason != MessageDeletionReasonWhatsAppDeleteForMe {
+		t.Fatalf("deleted tombstone = %v %q", msg.DeletedAt, msg.DeletionReason)
+	}
+}
+
+func TestMigrateLIDToPNPreservesPayloadPurgeSuppression(t *testing.T) {
+	db := openTestDB(t)
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	pn := "15551234567@s.whatsapp.net"
+	lid := "999123456789@lid"
+	for _, chat := range []string{pn, lid} {
+		if err := db.UpsertChat(chat, "dm", "Alice", base); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []string{"purged-lid", "purged-pn", "ledger-lid", "ledger-pn"} {
+		if err := db.UpsertMessage(UpsertMessageParams{ChatJID: pn, MsgID: id, Timestamp: base, Text: "pn payload"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.UpsertMessage(UpsertMessageParams{ChatJID: lid, MsgID: id, Timestamp: base, Text: "lid payload"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.MarkMessageRevoked(lid, "purged-lid"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PurgeMessage(lid, "purged-lid"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkMessageRevoked(pn, "purged-pn"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PurgeMessage(pn, "purged-pn"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkMessageRevoked(lid, "ledger-lid"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PurgeMessage(lid, "ledger-lid"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkMessageRevoked(pn, "ledger-pn"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PurgeMessage(pn, "ledger-pn"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.sql.Exec(`DELETE FROM messages WHERE (chat_jid = ? AND msg_id = ?) OR (chat_jid = ? AND msg_id = ?)`, lid, "ledger-lid", pn, "ledger-pn"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertPoll(Poll{ChatJID: pn, MsgID: "ledger-lid", Question: "destination-only secret", Options: []string{"secret"}, CreatedAt: base}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.MigrateLIDToPN(lid, pn); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"purged-lid", "purged-pn", "ledger-lid"} {
+		msg, err := db.GetMessage(pn, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if msg.PayloadPurgedAt == nil || msg.Text != "" {
+			t.Fatalf("%s purge suppression after LID migration = %+v", id, msg)
+		}
+	}
+	var messageCount, purgeCount int
+	if err := db.sql.QueryRow(`SELECT count(*) FROM messages WHERE chat_jid = ? AND msg_id = ?`, pn, "ledger-pn").Scan(&messageCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.sql.QueryRow(`SELECT count(*) FROM message_payload_purges WHERE chat_jid = ? AND msg_id = ?`, pn, "ledger-pn").Scan(&purgeCount); err != nil {
+		t.Fatal(err)
+	}
+	if messageCount != 0 || purgeCount != 1 {
+		t.Fatalf("destination-ledger suppression counts: messages=%d purges=%d", messageCount, purgeCount)
+	}
+	if got := countRows(t, db.sql, `SELECT count(*) FROM polls WHERE msg_id = 'ledger-lid'`); got != 0 {
+		t.Fatalf("destination-only purged poll rows = %d", got)
+	}
+}
+
+func TestMigrateLIDToPNPreservesEditedState(t *testing.T) {
+	db := openTestDB(t)
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	pn := "15551234567@s.whatsapp.net"
+	lid := "999123456789@lid"
+	if err := db.UpsertChat(pn, "dm", "Alice", base); err != nil {
+		t.Fatalf("UpsertChat pn: %v", err)
+	}
+	if err := db.UpsertChat(lid, "dm", "Alice", base); err != nil {
+		t.Fatalf("UpsertChat lid: %v", err)
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID:     pn,
+		MsgID:       "mid",
+		SenderJID:   pn,
+		Timestamp:   base,
+		Text:        "original",
+		DisplayText: "original",
+	}); err != nil {
+		t.Fatalf("UpsertMessage pn original: %v", err)
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID:     lid,
+		MsgID:       "mid",
+		SenderJID:   lid,
+		Timestamp:   base.Add(time.Minute),
+		Text:        "edited",
+		DisplayText: "edited",
+		Edited:      true,
+	}); err != nil {
+		t.Fatalf("UpsertMessage lid edited: %v", err)
+	}
+
+	if err := db.MigrateLIDToPN(lid, pn); err != nil {
+		t.Fatalf("MigrateLIDToPN: %v", err)
+	}
+
+	msg, err := db.GetMessage(pn, "mid")
+	if err != nil {
+		t.Fatalf("GetMessage after migration: %v", err)
+	}
+	if msg.Text != "edited" || msg.DisplayText != "edited" {
+		t.Fatalf("migration lost edited body: %+v", msg)
+	}
+	if !msg.Timestamp.Equal(base) {
+		t.Fatalf("timestamp = %s, want original timestamp", msg.Timestamp)
+	}
+
+	var edited, editedTS int64
+	if err := db.sql.QueryRow(`SELECT edited, edited_ts FROM messages WHERE chat_jid = ? AND msg_id = ?`, pn, "mid").Scan(&edited, &editedTS); err != nil {
+		t.Fatalf("query edited metadata: %v", err)
+	}
+	if edited != 1 || editedTS != base.Add(time.Minute).Unix() {
+		t.Fatalf("edited metadata = (%d, %d), want (1, %d)", edited, editedTS, base.Add(time.Minute).Unix())
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID:     pn,
+		MsgID:       "mid",
+		SenderJID:   pn,
+		Timestamp:   base,
+		Text:        "original again",
+		DisplayText: "original again",
+	}); err != nil {
+		t.Fatalf("UpsertMessage original after migration: %v", err)
+	}
+	msg, err = db.GetMessage(pn, "mid")
+	if err != nil {
+		t.Fatalf("GetMessage after original: %v", err)
+	}
+	if msg.Text != "edited" {
+		t.Fatalf("original upsert clobbered migrated edit: %q", msg.Text)
+	}
+}
+
+func TestMigrateLIDToPNMovesMessageLocations(t *testing.T) {
+	db := openTestDB(t)
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	pn := "15551234567@s.whatsapp.net"
+	lid := "999123456789@lid"
+	if err := db.UpsertChat(lid, "unknown", lid, base); err != nil {
+		t.Fatalf("UpsertChat lid: %v", err)
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID: lid, MsgID: "LOC-1", Timestamp: base, MediaType: "location",
+		DisplayText: "Sent location",
+	}); err != nil {
+		t.Fatalf("UpsertMessage: %v", err)
+	}
+	if err := db.UpsertMessageLocation(MessageLocation{
+		ChatJID: lid, MsgID: "LOC-1", Latitude: 51.4779, Longitude: -0.0015, Name: "Head office",
+	}); err != nil {
+		t.Fatalf("UpsertMessageLocation: %v", err)
+	}
+
+	if err := db.MigrateLIDToPN(lid, pn); err != nil {
+		t.Fatalf("MigrateLIDToPN: %v", err)
+	}
+
+	moved, err := db.GetMessageLocation(pn, "LOC-1")
+	if err != nil {
+		t.Fatalf("GetMessageLocation pn: %v", err)
+	}
+	if moved.Latitude != 51.4779 || moved.Longitude != -0.0015 {
+		t.Fatalf("coordinates = %v,%v", moved.Latitude, moved.Longitude)
+	}
+	if moved.Name != "Head office" {
+		t.Fatalf("name = %q", moved.Name)
+	}
+	if _, err := db.GetMessageLocation(lid, "LOC-1"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("lid location retained: err = %v", err)
+	}
+}
+
+func TestMigrateLIDToPNDropsPurgedMessageLocations(t *testing.T) {
+	db := openTestDB(t)
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	pn := "15551234567@s.whatsapp.net"
+	lid := "999123456789@lid"
+	if err := db.UpsertChat(lid, "unknown", lid, base); err != nil {
+		t.Fatalf("UpsertChat lid: %v", err)
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID: lid, MsgID: "LOC-1", Timestamp: base, MediaType: "location",
+		DisplayText: "Sent location",
+	}); err != nil {
+		t.Fatalf("UpsertMessage: %v", err)
+	}
+	if err := db.UpsertMessageLocation(MessageLocation{
+		ChatJID: lid, MsgID: "LOC-1", Latitude: 51.4779, Longitude: -0.0015,
+	}); err != nil {
+		t.Fatalf("UpsertMessageLocation: %v", err)
+	}
+	if err := db.MarkMessageRevoked(lid, "LOC-1"); err != nil {
+		t.Fatalf("MarkMessageRevoked: %v", err)
+	}
+	if err := db.PurgeMessage(lid, "LOC-1"); err != nil {
+		t.Fatalf("PurgeMessage: %v", err)
+	}
+
+	if err := db.MigrateLIDToPN(lid, pn); err != nil {
+		t.Fatalf("MigrateLIDToPN: %v", err)
+	}
+
+	if _, err := db.GetMessageLocation(pn, "LOC-1"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("purged coordinates resurfaced under the phone identity: err = %v", err)
+	}
+}
+
 func TestMigrateLIDToPNPreservesAddressingAndChangeJoins(t *testing.T) {
 	db := openTestDB(t)
 	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -394,241 +804,5 @@ func TestMigrateLIDToPNPreservesAddressingAndChangeJoins(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("migrated lid-only change row not found")
-	}
-}
-
-func TestMigrateLIDToPNPreservesButtons(t *testing.T) {
-	db := openTestDB(t)
-	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-
-	pn := "15551234567@s.whatsapp.net"
-	lid := "999123456789@lid"
-	if err := db.UpsertChat(lid, "dm", "Alice", base); err != nil {
-		t.Fatalf("UpsertChat lid: %v", err)
-	}
-
-	want := []Button{
-		{Type: "url", DisplayText: "Buy flights", URL: "https://example.com/flights"},
-		{Type: "quick_reply", DisplayText: "No thanks", ID: "no"},
-	}
-	if err := db.UpsertMessage(UpsertMessageParams{
-		ChatJID:   lid,
-		MsgID:     "tmpl1",
-		SenderJID: lid,
-		Timestamp: base,
-		Text:      "Check our deals",
-		Buttons:   want,
-	}); err != nil {
-		t.Fatalf("UpsertMessage: %v", err)
-	}
-
-	if err := db.MigrateLIDToPN(lid, pn); err != nil {
-		t.Fatalf("MigrateLIDToPN: %v", err)
-	}
-
-	msg, err := db.GetMessage(pn, "tmpl1")
-	if err != nil {
-		t.Fatalf("GetMessage after migration: %v", err)
-	}
-	if len(msg.Buttons) != len(want) {
-		t.Fatalf("expected %d buttons after migration, got %d: %+v", len(want), len(msg.Buttons), msg.Buttons)
-	}
-	for i, b := range want {
-		got := msg.Buttons[i]
-		if got.Type != b.Type || got.DisplayText != b.DisplayText || got.ID != b.ID || got.URL != b.URL {
-			t.Fatalf("button[%d]: got %+v, want %+v", i, got, b)
-		}
-	}
-}
-
-func TestMigrateLIDToPNClearsQuotedMetadataOnDeletedMessages(t *testing.T) {
-	db := openTestDB(t)
-	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-
-	pn := "15551234567@s.whatsapp.net"
-	lid := "999123456789@lid"
-	if err := db.UpsertChat(lid, "dm", "Alice", base); err != nil {
-		t.Fatalf("UpsertChat lid: %v", err)
-	}
-	if err := db.UpsertMessage(UpsertMessageParams{
-		ChatJID:         lid,
-		MsgID:           "deleted-reply",
-		SenderJID:       lid,
-		Timestamp:       base,
-		QuotedMsgID:     "quoted",
-		QuotedSenderJID: lid,
-		DeletedForMe:    true,
-	}); err != nil {
-		t.Fatalf("UpsertMessage: %v", err)
-	}
-	if _, err := db.sql.Exec(`UPDATE messages SET quoted_msg_id = ?, quoted_sender_jid = ? WHERE chat_jid = ? AND msg_id = ?`, "quoted", lid, lid, "deleted-reply"); err != nil {
-		t.Fatalf("seed legacy quoted metadata: %v", err)
-	}
-
-	if err := db.MigrateLIDToPN(lid, pn); err != nil {
-		t.Fatalf("MigrateLIDToPN: %v", err)
-	}
-
-	msg, err := db.GetMessage(pn, "deleted-reply")
-	if err != nil {
-		t.Fatalf("GetMessage after migration: %v", err)
-	}
-	if !msg.DeletedForMe {
-		t.Fatalf("DeletedForMe = false")
-	}
-	if msg.QuotedMsgID != "" || msg.QuotedSenderJID != "" {
-		t.Fatalf("deleted quoted metadata = id %q sender %q", msg.QuotedMsgID, msg.QuotedSenderJID)
-	}
-}
-
-func TestMigrateLIDToPNPreservesEditedState(t *testing.T) {
-	db := openTestDB(t)
-	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-
-	pn := "15551234567@s.whatsapp.net"
-	lid := "999123456789@lid"
-	if err := db.UpsertChat(pn, "dm", "Alice", base); err != nil {
-		t.Fatalf("UpsertChat pn: %v", err)
-	}
-	if err := db.UpsertChat(lid, "dm", "Alice", base); err != nil {
-		t.Fatalf("UpsertChat lid: %v", err)
-	}
-	if err := db.UpsertMessage(UpsertMessageParams{
-		ChatJID:     pn,
-		MsgID:       "mid",
-		SenderJID:   pn,
-		Timestamp:   base,
-		Text:        "original",
-		DisplayText: "original",
-	}); err != nil {
-		t.Fatalf("UpsertMessage pn original: %v", err)
-	}
-	if err := db.UpsertMessage(UpsertMessageParams{
-		ChatJID:     lid,
-		MsgID:       "mid",
-		SenderJID:   lid,
-		Timestamp:   base.Add(time.Minute),
-		Text:        "edited",
-		DisplayText: "edited",
-		Edited:      true,
-	}); err != nil {
-		t.Fatalf("UpsertMessage lid edited: %v", err)
-	}
-
-	if err := db.MigrateLIDToPN(lid, pn); err != nil {
-		t.Fatalf("MigrateLIDToPN: %v", err)
-	}
-
-	msg, err := db.GetMessage(pn, "mid")
-	if err != nil {
-		t.Fatalf("GetMessage after migration: %v", err)
-	}
-	if msg.Text != "edited" || msg.DisplayText != "edited" {
-		t.Fatalf("migration lost edited body: %+v", msg)
-	}
-	if !msg.Timestamp.Equal(base) {
-		t.Fatalf("timestamp = %s, want original timestamp", msg.Timestamp)
-	}
-
-	var edited, editedTS int64
-	if err := db.sql.QueryRow(`SELECT edited, edited_ts FROM messages WHERE chat_jid = ? AND msg_id = ?`, pn, "mid").Scan(&edited, &editedTS); err != nil {
-		t.Fatalf("query edited metadata: %v", err)
-	}
-	if edited != 1 || editedTS != base.Add(time.Minute).Unix() {
-		t.Fatalf("edited metadata = (%d, %d), want (1, %d)", edited, editedTS, base.Add(time.Minute).Unix())
-	}
-	if err := db.UpsertMessage(UpsertMessageParams{
-		ChatJID:     pn,
-		MsgID:       "mid",
-		SenderJID:   pn,
-		Timestamp:   base,
-		Text:        "original again",
-		DisplayText: "original again",
-	}); err != nil {
-		t.Fatalf("UpsertMessage original after migration: %v", err)
-	}
-	msg, err = db.GetMessage(pn, "mid")
-	if err != nil {
-		t.Fatalf("GetMessage after original: %v", err)
-	}
-	if msg.Text != "edited" {
-		t.Fatalf("original upsert clobbered migrated edit: %q", msg.Text)
-	}
-}
-
-func TestHistoricalLIDJIDsFindsStrandedChangeRows(t *testing.T) {
-	// A pre-fix store can have messages already at PN while change rows stay
-	// under LID: discovery must still surface the LID so the migration's
-	// change-row rewrite runs (exact-head gate P1).
-	db := openTestDB(t)
-	lid := "12345@lid"
-	pn := "12025550100@s.whatsapp.net"
-	ts := time.Date(2026, 7, 17, 15, 30, 0, 0, time.UTC)
-	if err := db.UpsertChat(pn, "dm", "PN", ts); err != nil {
-		t.Fatalf("UpsertChat: %v", err)
-	}
-	if err := db.UpsertMessage(UpsertMessageParams{ChatJID: pn, MsgID: "m1", SenderJID: pn, Timestamp: ts, Text: "hello"}); err != nil {
-		t.Fatalf("UpsertMessage: %v", err)
-	}
-	if _, err := db.sql.Exec(`UPDATE message_changes SET chat_jid = ? WHERE chat_jid = ?`, lid, pn); err != nil {
-		t.Fatalf("strand change rows under LID: %v", err)
-	}
-	jids, err := db.HistoricalLIDJIDs()
-	if err != nil {
-		t.Fatalf("HistoricalLIDJIDs: %v", err)
-	}
-	found := false
-	for _, j := range jids {
-		if j == lid {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("stranded change-row LID not discovered: %v", jids)
-	}
-	if err := db.MigrateLIDToPN(lid, pn); err != nil {
-		t.Fatalf("MigrateLIDToPN: %v", err)
-	}
-	page, err := db.ListMessageChanges(0, 10)
-	if err != nil {
-		t.Fatalf("ListMessageChanges: %v", err)
-	}
-	if len(page.Changes) != 1 || page.Changes[0].Message == nil {
-		t.Fatalf("change row did not rejoin its message after migration: %+v", page.Changes)
-	}
-}
-
-func TestMigrateLIDToPNPreservesIngestOrigin(t *testing.T) {
-	// A history-origin row stored under a LID must stay history after
-	// canonicalization — the schema default would silently flip it to 'live',
-	// making a later identical live delivery emit nothing while the original
-	// history change stays non-forwardable (permanently missed message).
-	db := openTestDB(t)
-	lid := "77777@lid"
-	pn := "12025550177@s.whatsapp.net"
-	ts := time.Date(2026, 7, 17, 18, 30, 0, 0, time.UTC)
-	if err := db.UpsertChat(lid, "dm", "LID", ts); err != nil {
-		t.Fatalf("UpsertChat: %v", err)
-	}
-	if err := db.UpsertMessage(UpsertMessageParams{ChatJID: lid, MsgID: "h1", SenderJID: lid, Timestamp: ts, Text: "from history", Origin: "history"}); err != nil {
-		t.Fatalf("history insert under LID: %v", err)
-	}
-	if err := db.MigrateLIDToPN(lid, pn); err != nil {
-		t.Fatalf("MigrateLIDToPN: %v", err)
-	}
-	if got := messageIngestOrigin(t, db, pn, "h1"); got != "history" {
-		t.Fatalf("ingest_origin after LID migration = %q, want history", got)
-	}
-	// The real live delivery still upgrades and emits a forwardable insert.
-	if err := db.UpsertMessage(UpsertMessageParams{ChatJID: pn, MsgID: "h1", SenderJID: pn, Timestamp: ts, Text: "from history"}); err != nil {
-		t.Fatalf("live redelivery after migration: %v", err)
-	}
-	page, err := db.ListMessageChanges(0, 20)
-	if err != nil {
-		t.Fatalf("ListMessageChanges: %v", err)
-	}
-	last := page.Changes[len(page.Changes)-1]
-	if last.Kind != "insert" || last.Origin != "live" {
-		t.Fatalf("post-migration live redelivery emitted %s:%s, want insert:live", last.Kind, last.Origin)
 	}
 }

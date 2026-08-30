@@ -1,7 +1,7 @@
 {
   "name": "wacli",
   "private": true,
-  "packageManager": "pnpm@10.34.4",
+  "packageManager": "pnpm@11.20.0+sha512.9a6f330a95b66446ea088faf1521405a8a01f07fde7124cc9958dfed52d4bb436737e65b08f85f37b46fcba375092558ac51262b816844b22f63406ed166bfee",
   "scripts": {
     "wacli": "bash -lc 'pnpm -s build >/dev/null && exec ./dist/wacli \"$@\"' _",
     "build": "mkdir -p dist && CGO_ENABLED=1 CGO_CFLAGS=\"${CGO_CFLAGS:+$CGO_CFLAGS }-Wno-error=missing-braces\" go build -tags sqlite_fts5 -o dist/wacli ./cmd/wacli",
@@ -19,7 +19,7 @@
     "govulncheck:binary": "node scripts/govulncheck-stdlib.mjs binary dist/wacli",
     "format": "gofmt -w .",
     "format:check": "bash -lc 'out=$(gofmt -l .); if [ -n \"$out\" ]; then echo \"$out\"; exit 1; fi'",
-    "generate:sqlc": "go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate",
+    "generate:sqlc": "go tool github.com/sqlc-dev/sqlc/cmd/sqlc generate",
     "docs:site": "node scripts/build-docs-site.mjs",
     "check:changed": "pnpm run test",
     "test:changed": "pnpm run test",

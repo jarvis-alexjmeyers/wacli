@@ -39,10 +39,13 @@ func TestRefreshGroupsStoresGroupsAndChats(t *testing.T) {
 	a.wa = f
 
 	gid := types.JID{User: "12345", Server: types.GroupServer}
+	ownerLID := types.JID{User: "999123456789", Server: types.HiddenUserServer}
+	ownerPN := types.JID{User: "15551234567", Server: types.DefaultUserServer}
+	f.lids[ownerLID] = ownerPN
 	created := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 	f.groups[gid] = &types.GroupInfo{
 		JID:               gid,
-		OwnerJID:          types.JID{User: "999", Server: types.DefaultUserServer},
+		OwnerJID:          ownerLID,
 		GroupName:         types.GroupName{Name: "MyGroup"},
 		GroupCreated:      created,
 		GroupLinkedParent: types.GroupLinkedParent{LinkedParentJID: types.JID{User: "parent", Server: types.GroupServer}},
@@ -61,12 +64,49 @@ func TestRefreshGroupsStoresGroupsAndChats(t *testing.T) {
 	if gs[0].LinkedParentJID != "parent@g.us" {
 		t.Fatalf("expected linked parent to be stored, got %+v", gs[0])
 	}
+	if gs[0].OwnerJID != ownerPN.String() {
+		t.Fatalf("OwnerJID = %q, want %q", gs[0].OwnerJID, ownerPN.String())
+	}
 	c, err := a.db.GetChat(gid.String())
 	if err != nil {
 		t.Fatalf("GetChat: %v", err)
 	}
 	if c.Kind != "group" {
 		t.Fatalf("expected chat kind group, got %q", c.Kind)
+	}
+}
+
+func TestRefreshGroupsPreservesChatLastMessageTimestamp(t *testing.T) {
+	a := newTestApp(t)
+	f := newFakeWA()
+	a.wa = f
+
+	gid := types.JID{User: "12345", Server: types.GroupServer}
+	messageTS := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	refreshTS := messageTS.Add(24 * time.Hour)
+	if err := a.db.UpsertChat(gid.String(), "group", "Old Name", messageTS); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	f.groups[gid] = &types.GroupInfo{
+		JID:       gid,
+		GroupName: types.GroupName{Name: "New Name"},
+	}
+	previousNowUTC := nowUTC
+	nowUTC = func() time.Time { return refreshTS }
+	t.Cleanup(func() { nowUTC = previousNowUTC })
+
+	if err := a.refreshGroups(context.Background()); err != nil {
+		t.Fatalf("refreshGroups: %v", err)
+	}
+	c, err := a.db.GetChat(gid.String())
+	if err != nil {
+		t.Fatalf("GetChat: %v", err)
+	}
+	if c.Name != "New Name" {
+		t.Fatalf("expected refreshed chat name, got %q", c.Name)
+	}
+	if !c.LastMessageTS.Equal(messageTS) {
+		t.Fatalf("expected LastMessageTS=%s, got %s", messageTS, c.LastMessageTS)
 	}
 }
 

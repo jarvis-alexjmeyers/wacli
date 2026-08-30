@@ -6,8 +6,8 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 export const RELEASE_REPOSITORY = "openclaw/wacli";
-export const RELEASE_GO_VERSION = "go1.25.12";
-export const RELEASE_GO_TOOLCHAIN = "go1.25.12";
+export const RELEASE_GO_VERSION = "go1.26.5";
+export const RELEASE_GO_TOOLCHAIN = "go1.26.5";
 export const RELEASE_GOVULNCHECK_VERSION = "v1.5.0";
 export const RELEASE_IDENTIFIER = "org.openclaw.wacli";
 export const RELEASE_TEAM_ID = "FWJYW4S8P8";
@@ -37,6 +37,17 @@ export function assertCommit(commit) {
   if (!/^[0-9a-f]{40}$/.test(String(commit ?? ""))) {
     throw new Error("release commit must be a full lowercase 40-character SHA");
   }
+}
+
+export function releaseGoVersionForCommit(commit, options = {}) {
+  assertCommit(commit);
+  const run = options.run ?? runCommand;
+  const result = run("git", ["show", `${commit}:go.mod`], { cwd: repositoryRoot });
+  const matches = [...String(result.stdout).matchAll(/^go (\d+\.\d+\.\d+)$/gm)];
+  if (matches.length !== 1) {
+    throw new Error(`release commit ${commit} must declare one exact Go version in go.mod`);
+  }
+  return `go${matches[0][1]}`;
 }
 
 export function archiveNames(version) {
@@ -198,8 +209,19 @@ export function assertCodeSignatureIdentity(displayText, requirementText) {
     throw new Error("signature is missing a trusted timestamp");
   }
 
-  const requirement = String(requirementText).replace(/\s+/g, " ").trim();
-  if (requirement !== RELEASE_DESIGNATED_REQUIREMENT) {
+  const normalizeRequirement = (text) =>
+    String(text)
+      .replace(/\s+/g, " ")
+      // codesign's display normalization drops quotes around alphanumeric
+      // values (leaf[subject.OU] = FWJYW4S8P8 vs = "FWJYW4S8P8"); compare
+      // both sides without them so the check is not display-format-brittle.
+      .replace(/"([A-Za-z0-9.]+)"/g, "$1")
+      // some codesign versions append the "Executable=..." header line to
+      // the requirements output; it is not part of the requirement itself.
+      .replace(/ Executable=.*$/, "")
+      .trim();
+  const requirement = normalizeRequirement(requirementText);
+  if (requirement !== normalizeRequirement(RELEASE_DESIGNATED_REQUIREMENT)) {
     throw new Error(`embedded designated requirement mismatch: ${JSON.stringify(requirement)}`);
   }
 }
@@ -307,6 +329,10 @@ export function assertGoBuildInfo(binary, version, options = {}) {
   if (!options.expectedGoos || !options.expectedGoarch) {
     throw new Error("expected GOOS and GOARCH are required for release build verification");
   }
+  const expectedGoVersion = options.expectedGoVersion ?? RELEASE_GO_VERSION;
+  if (!/^go\d+\.\d+\.\d+$/.test(expectedGoVersion)) {
+    throw new Error("expected Go version must look like goX.Y.Z");
+  }
   const result = run("go", ["version", "-m", "-json", binary], {
     env: sanitizedExecutionEnv({}, options.env ?? process.env),
   });
@@ -316,9 +342,9 @@ export function assertGoBuildInfo(binary, version, options = {}) {
   } catch {
     throw new Error(`${path.basename(binary)} has malformed Go build information`);
   }
-  if (buildInfo.GoVersion !== RELEASE_GO_VERSION) {
+  if (buildInfo.GoVersion !== expectedGoVersion) {
     throw new Error(
-      `${path.basename(binary)} was built with ${buildInfo.GoVersion ?? "unknown"}, not ${RELEASE_GO_VERSION}`,
+      `${path.basename(binary)} was built with ${buildInfo.GoVersion ?? "unknown"}, not ${expectedGoVersion}`,
     );
   }
   if (buildInfo.Path !== "github.com/openclaw/wacli/cmd/wacli") {
